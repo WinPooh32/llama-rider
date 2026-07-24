@@ -90,11 +90,3 @@ func (p *Proxy) saveCache(model string) {
 	respBody, _ := io.ReadAll(resp.Body)
 	slog.Info("save response", "status", resp.StatusCode, "body", string(respBody))
 }
-
-func ParseUpstream(raw string) (*url.URL, error) {
-	u, err := url.Parse(raw)
-	if err != nil {
-		return nil, fmt.Errorf("parse upstream %q: %w", raw, err)
-	}
-	return u, nil
-}
