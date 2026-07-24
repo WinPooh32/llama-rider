@@ -10,29 +10,33 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"os"
 )
 
 type Proxy struct {
-	proxy    *httputil.ReverseProxy
-	upstream string
-	model    string
-	client   http.Client
+	proxy        *httputil.ReverseProxy
+	upstream     string
+	model        string
+	slotSavePath string
+	client       http.Client
 }
 
-func New(upstream *url.URL, model string) *Proxy {
+func New(upstream *url.URL, model, slotSavePath string) *Proxy {
 	return &Proxy{
-		proxy:    httputil.NewSingleHostReverseProxy(upstream),
-		upstream: upstream.String(),
-		model:    model,
+		proxy:        httputil.NewSingleHostReverseProxy(upstream),
+		upstream:     upstream.String(),
+		model:        model,
+		slotSavePath: slotSavePath,
 	}
 }
 
 type requestBody struct {
-	System   string         `json:"system"`
-	Tools    json.RawMessage `json:"tools"`
-	Model    string         `json:"model"`
-	MaxToken int            `json:"max_tokens"`
-	Stream   bool           `json:"stream"`
+	System    string         `json:"system"`
+	Tools     json.RawMessage `json:"tools"`
+	Messages  []json.RawMessage `json:"messages"`
+	Model     string         `json:"model"`
+	MaxTokens int            `json:"max_tokens"`
+	Stream    bool           `json:"stream"`
 }
 
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -54,22 +58,26 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		cacheFile := p.model + ".bin"
-		p.restoreCache(cacheFile)
-
+		modelCache := p.model + ".bin"
 		systemHash := hashSystem(req.System, req.Tools)
-		warmupFile := fmt.Sprintf("%s----%x.bin", p.model, systemHash)
+		systemCache := fmt.Sprintf("%s----%x.bin", p.model, systemHash)
 
-		// Try to restore system-specific cache
-		restoreResp := p.tryRestoreCache(warmupFile)
-
-		if !restoreResp {
-			// Warm up the cache with the system prompt
+		// Ensure system cache file exists on disk
+		if !cacheFileExists(p.slotSavePath, systemCache) {
 			p.warmupSystem(req.System, req.Tools)
-			p.saveCache(warmupFile)
+			p.saveCache(systemCache)
 		}
 
-		defer p.saveCache(cacheFile)
+		switch {
+		case len(req.Messages) > 1:
+			// Continuation: restore model cache
+			p.restoreCache(modelCache)
+		default:
+			// New conversation: restore system cache
+			p.restoreCache(systemCache)
+		}
+
+		defer p.saveCache(modelCache)
 
 		r.Body = io.NopCloser(bytes.NewReader(body))
 		p.proxy.ServeHTTP(w, r)
@@ -77,6 +85,14 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	p.proxy.ServeHTTP(w, r)
+}
+
+func cacheFileExists(slotSavePath, filename string) bool {
+	info, err := os.Stat(fmt.Sprintf("%s/%s", slotSavePath, filename))
+	if err != nil {
+		return false
+	}
+	return info.Size() > 0
 }
 
 func hashSystem(system string, tools json.RawMessage) uint32 {
@@ -117,25 +133,6 @@ func (p *Proxy) warmupSystem(system string, tools json.RawMessage) {
 
 	_, _ = io.Copy(io.Discard, resp.Body)
 	slog.Info("warmup done", "status", resp.StatusCode)
-}
-
-func (p *Proxy) tryRestoreCache(filename string) bool {
-	reqURL := fmt.Sprintf("%s/slots/0?action=restore", p.upstream)
-
-	slog.Info("try restore cache", "url", reqURL, "filename", filename)
-
-	reqBody := []byte(fmt.Sprintf(`{"filename":%q}`, filename))
-	resp, err := p.client.Post(reqURL, "application/json", bytes.NewReader(reqBody))
-	if err != nil {
-		slog.Warn("cache restore", "filename", filename, "err", err)
-		return false
-	}
-	defer resp.Body.Close()
-
-	respBody, _ := io.ReadAll(resp.Body)
-	slog.Info("restore response", "status", resp.StatusCode, "body", string(respBody))
-
-	return resp.StatusCode == http.StatusOK
 }
 
 func (p *Proxy) restoreCache(filename string) {
