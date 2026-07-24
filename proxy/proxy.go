@@ -2,7 +2,6 @@ package proxy
 
 import (
 	"bytes"
-	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -14,45 +13,27 @@ import (
 type Proxy struct {
 	proxy    *httputil.ReverseProxy
 	upstream string
+	model    string
 	client   http.Client
 }
 
-func New(upstream *url.URL) *Proxy {
+func New(upstream *url.URL, model string) *Proxy {
 	return &Proxy{
 		proxy:    httputil.NewSingleHostReverseProxy(upstream),
 		upstream: upstream.String(),
+		model:    model,
 	}
 }
 
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	slog.Info("proxy", "method", r.Method, "path", r.URL.Path, "upstream", p.upstream)
 
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		slog.Error("read body", "err", err)
-		p.proxy.ServeHTTP(w, r)
-		return
+	if p.model != "" && r.URL.Path == "/v1/messages" {
+		p.restoreCache(p.model)
+		defer p.saveCache(p.model)
 	}
 
-	model := extractModel(body)
-	slog.Info("model", "name", model)
-	if model != "" && r.URL.Path == "/v1/messages" {
-		p.restoreCache(model)
-		defer p.saveCache(model)
-	}
-
-	r.Body = io.NopCloser(bytes.NewReader(body))
 	p.proxy.ServeHTTP(w, r)
-}
-
-func extractModel(body []byte) string {
-	var req struct {
-		Model string `json:"model"`
-	}
-	if err := json.Unmarshal(body, &req); err != nil {
-		return ""
-	}
-	return req.Model
 }
 
 func (p *Proxy) restoreCache(model string) {

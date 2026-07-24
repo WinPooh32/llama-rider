@@ -22,8 +22,9 @@ func main() {
 		os.Exit(1)
 	}
 
-	llamaPort := extractPort(llamaArgs)
-	upstream, _ := url.Parse(fmt.Sprintf("http://127.0.0.1:%d/", llamaPort))
+	llamaPort := extractArg(llamaArgs, "port")
+	llamaAlias := extractArg(llamaArgs, "alias")
+	upstream, _ := url.Parse(fmt.Sprintf("http://127.0.0.1:%s/", llamaPort))
 
 	cmd := exec.Command(llamaArgs[0], llamaArgs[1:]...)
 	cmd.Stdout = os.Stdout
@@ -34,10 +35,10 @@ func main() {
 	}
 	defer cmd.Wait()
 
-	slog.Info("proxy started", "upstream", upstream)
+	slog.Info("proxy started", "upstream", upstream, "alias", llamaAlias)
 
 	mux := http.NewServeMux()
-	mux.Handle("/v1/", proxy.New(upstream))
+	mux.Handle("/v1/", proxy.New(upstream, llamaAlias))
 
 	addr := fmt.Sprintf(":%s", *port)
 	slog.Info("proxy listening", "addr", addr)
@@ -47,15 +48,13 @@ func main() {
 	}
 }
 
-func extractPort(args []string) int {
+func extractArg(args []string, name string) string {
 	for i, arg := range args {
-		if arg == "--port" && i+1 < len(args) {
-			var port int
-			fmt.Sscanf(args[i+1], "%d", &port)
-			return port
+		if arg == fmt.Sprintf("--%s", name) && i+1 < len(args) {
+			return args[i+1]
 		}
 	}
-	slog.Error("could not find -port in llama-server arguments")
+	slog.Error(fmt.Sprintf("could not find --%s in llama-server arguments", name))
 	os.Exit(1)
-	return 0
+	return ""
 }
