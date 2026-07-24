@@ -24,7 +24,7 @@ func main() {
 
 	llamaPort := extractArg(llamaArgs, "port")
 	llamaAlias := extractArg(llamaArgs, "alias")
-	upstream, _ := url.Parse(fmt.Sprintf("http://127.0.0.1:%s/", llamaPort))
+	upstream, _ := url.Parse(fmt.Sprintf("http://127.0.0.1:%s", llamaPort))
 
 	cmd := exec.Command(llamaArgs[0], llamaArgs[1:]...)
 	cmd.Stdout = os.Stdout
