@@ -25,6 +25,7 @@ func main() {
 	llamaPort := extractArg(llamaArgs, "port")
 	llamaAlias := extractArg(llamaArgs, "alias")
 	slotSavePath := extractArg(llamaArgs, "slot-save-path")
+	dumpDir := "dumps"
 	upstream, _ := url.Parse(fmt.Sprintf("http://127.0.0.1:%s", llamaPort))
 
 	cmd := exec.Command(llamaArgs[0], llamaArgs[1:]...)
@@ -36,10 +37,10 @@ func main() {
 	}
 	defer cmd.Wait()
 
-	slog.Info("proxy started", "upstream", upstream, "alias", llamaAlias, "slotSavePath", slotSavePath)
+	slog.Info("proxy started", "upstream", upstream, "alias", llamaAlias, "slotSavePath", slotSavePath, "dumpDir", dumpDir)
 
 	mux := http.NewServeMux()
-	mux.Handle("/v1/", proxy.New(upstream, llamaAlias, slotSavePath))
+	mux.Handle("/v1/", proxy.New(upstream, llamaAlias, slotSavePath, dumpDir))
 
 	addr := fmt.Sprintf(":%s", *port)
 	slog.Info("proxy listening", "addr", addr)

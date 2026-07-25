@@ -11,6 +11,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"path/filepath"
 )
 
 type Proxy struct {
@@ -18,25 +19,27 @@ type Proxy struct {
 	upstream     string
 	model        string
 	slotSavePath string
+	dumpDir      string
 	client       http.Client
 }
 
-func New(upstream *url.URL, model, slotSavePath string) *Proxy {
+func New(upstream *url.URL, model, slotSavePath, dumpDir string) *Proxy {
 	return &Proxy{
 		proxy:        httputil.NewSingleHostReverseProxy(upstream),
 		upstream:     upstream.String(),
 		model:        model,
 		slotSavePath: slotSavePath,
+		dumpDir:      dumpDir,
 	}
 }
 
 type requestBody struct {
-	System    string         `json:"system"`
-	Tools     json.RawMessage `json:"tools"`
+	System    json.RawMessage   `json:"system"`
+	Tools     json.RawMessage   `json:"tools"`
 	Messages  []json.RawMessage `json:"messages"`
-	Model     string         `json:"model"`
-	MaxTokens int            `json:"max_tokens"`
-	Stream    bool           `json:"stream"`
+	Model     string            `json:"model"`
+	MaxTokens int               `json:"max_tokens"`
+	Stream    bool              `json:"stream"`
 }
 
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -62,25 +65,33 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		systemHash := hashSystem(req.System, req.Tools)
 		systemCache := fmt.Sprintf("%s----%x.bin", p.model, systemHash)
 
+		p.dumpRequest(systemHash, body)
+
+		fresh := false
+
 		// Ensure system cache file exists on disk
 		if !cacheFileExists(p.slotSavePath, systemCache) {
 			p.warmupSystem(req.System, req.Tools)
 			p.saveCache(systemCache)
+			fresh = true
 		}
 
-		switch {
-		case len(req.Messages) > 1:
-			// Continuation: restore model cache
-			p.restoreCache(modelCache)
-		default:
-			// New conversation: restore system cache
-			p.restoreCache(systemCache)
+		if !fresh {
+			switch {
+			case len(req.Messages) > 1:
+				// Continuation: restore model cache
+				p.restoreCache(modelCache)
+			default:
+				// New conversation: restore system cache
+				p.restoreCache(systemCache)
+			}
 		}
 
 		defer p.saveCache(modelCache)
 
 		r.Body = io.NopCloser(bytes.NewReader(body))
 		p.proxy.ServeHTTP(w, r)
+
 		return
 	}
 
@@ -88,31 +99,53 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func cacheFileExists(slotSavePath, filename string) bool {
-	info, err := os.Stat(fmt.Sprintf("%s/%s", slotSavePath, filename))
+	file := filepath.Join(slotSavePath, filename)
+	slog.Info("test file", "path", file)
+
+	info, err := os.Stat(file)
 	if err != nil {
 		return false
 	}
 	return info.Size() > 0
 }
 
-func hashSystem(system string, tools json.RawMessage) uint32 {
+func hashSystem(system json.RawMessage, tools json.RawMessage) uint32 {
 	h := fnv.New32a()
-	h.Write([]byte(system))
+	h.Write(system)
 	h.Write(tools)
 	return h.Sum32()
 }
 
-func (p *Proxy) warmupSystem(system string, tools json.RawMessage) {
+func hashRequest(body []byte) uint32 {
+	h := fnv.New32a()
+	h.Write(body)
+	return h.Sum32()
+}
+
+func (p *Proxy) dumpRequest(systemHash uint32, body []byte) {
+	reqHash := hashRequest(body)
+	filename := fmt.Sprintf("%s----%x----%x.json", p.model, systemHash, reqHash)
+	filepath := filepath.Join(p.dumpDir, filename)
+
+	if err := os.MkdirAll(p.dumpDir, 0755); err != nil {
+		slog.Warn("create dump dir", "err", err)
+		return
+	}
+
+	if err := os.WriteFile(filepath, body, 0644); err != nil {
+		slog.Warn("write dump", "filename", filename, "err", err)
+	}
+}
+
+func (p *Proxy) warmupSystem(system json.RawMessage, tools json.RawMessage) {
 	slog.Info("warmup system", "model", p.model)
 
-	payload := map[string]interface{}{
+	payload := map[string]any{
 		"model":      p.model,
 		"max_tokens": 0,
 		"system":     system,
 		"stream":     false,
-		"messages": []map[string]string{
-			{"role": "user", "content": ""},
-		},
+		"messages":   []map[string]string{},
 	}
 	if len(tools) > 0 {
 		payload["tools"] = tools
@@ -140,7 +173,7 @@ func (p *Proxy) restoreCache(filename string) {
 
 	slog.Info("restore cache", "url", reqURL, "filename", filename)
 
-	reqBody := []byte(fmt.Sprintf(`{"filename":%q}`, filename))
+	reqBody := fmt.Appendf(nil, `{"filename":%q}`, filename)
 	resp, err := p.client.Post(reqURL, "application/json", bytes.NewReader(reqBody))
 	if err != nil {
 		slog.Warn("cache restore", "filename", filename, "err", err)
@@ -157,7 +190,7 @@ func (p *Proxy) saveCache(filename string) {
 
 	slog.Info("save cache", "url", reqURL, "filename", filename)
 
-	reqBody := []byte(fmt.Sprintf(`{"filename":%q}`, filename))
+	reqBody := fmt.Appendf(nil, `{"filename":%q}`, filename)
 	resp, err := p.client.Post(reqURL, "application/json", bytes.NewReader(reqBody))
 	if err != nil {
 		slog.Warn("cache save", "filename", filename, "err", err)
