@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 )
 
 type Proxy struct {
@@ -21,7 +22,7 @@ type Proxy struct {
 	model          string
 	slotSavePath   string
 	dumpDir        string
-	client         http.Client
+	client         *http.Client
 	mut            *sync.Mutex
 	modelCacheName string
 }
@@ -34,6 +35,9 @@ func New(upstream *url.URL, model, slotSavePath, dumpDir string) *Proxy {
 		slotSavePath: slotSavePath,
 		dumpDir:      dumpDir,
 		mut:          new(sync.Mutex),
+		client: &http.Client{
+			Timeout: 120 * time.Second,
+		},
 	}
 }
 
@@ -203,18 +207,22 @@ func (p *Proxy) restoreCache(filename string) {
 }
 
 func (p *Proxy) saveCache(filename string) {
-	reqURL := fmt.Sprintf("%s/slots/0?action=save", p.upstream)
+	for range 3 {
+		reqURL := fmt.Sprintf("%s/slots/0?action=save", p.upstream)
 
-	slog.Info("save cache", "url", reqURL, "filename", filename)
+		slog.Info("save cache", "url", reqURL, "filename", filename)
 
-	reqBody := fmt.Appendf(nil, `{"filename":%q}`, filename)
-	resp, err := p.client.Post(reqURL, "application/json", bytes.NewReader(reqBody))
-	if err != nil {
-		slog.Warn("cache save", "filename", filename, "err", err)
-		return
+		reqBody := fmt.Appendf(nil, `{"filename":%q}`, filename)
+		resp, err := p.client.Post(reqURL, "application/json", bytes.NewReader(reqBody))
+		if err != nil {
+			slog.Warn("cache save", "filename", filename, "err", err)
+			continue
+		}
+		defer resp.Body.Close()
+
+		respBody, _ := io.ReadAll(resp.Body)
+		slog.Info("save response", "status", resp.StatusCode, "body", string(respBody))
+
+		break
 	}
-	defer resp.Body.Close()
-
-	respBody, _ := io.ReadAll(resp.Body)
-	slog.Info("save response", "status", resp.StatusCode, "body", string(respBody))
 }

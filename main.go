@@ -71,19 +71,14 @@ func main() {
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			slog.Error("server", "err", err)
 		}
-	}()
 
-	go func() {
-		defer stop()
-
-		if err := cmd.Wait(); err != nil {
-			slog.Error("wait llama-server", "err", err)
+		slog.Info("send exit signal to llama-server")
+		if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
+			slog.Error("signal llama-server to quit", "err", err)
 		}
 	}()
 
 	go func() {
-		defer close(done)
-
 		<-ctx.Done()
 		slog.Info("got exit signal")
 
@@ -94,10 +89,14 @@ func main() {
 		if err := srv.Shutdown(shutdownCtx); err != nil {
 			slog.Warn("http shutdown is timed out", "err", err)
 		}
+	}()
 
-		slog.Info("send exit signal to llama-server")
-		if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
-			slog.Error("signal llama-server to quit", "err", err)
+	go func() {
+		defer close(done)
+		defer stop()
+
+		if err := cmd.Wait(); err != nil {
+			slog.Error("wait llama-server", "err", err)
 		}
 	}()
 
