@@ -40,7 +40,7 @@ func main() {
 	slog.Info("proxy started", "upstream", upstream, "alias", llamaAlias, "slotSavePath", slotSavePath, "dumpDir", dumpDir)
 
 	mux := http.NewServeMux()
-	mux.Handle("/v1/", proxy.New(upstream, llamaAlias, slotSavePath, dumpDir))
+	mux.Handle("/", proxy.New(upstream, llamaAlias, slotSavePath, dumpDir))
 
 	addr := fmt.Sprintf(":%s", *port)
 	slog.Info("proxy listening", "addr", addr)
