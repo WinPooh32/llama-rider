@@ -67,24 +67,17 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 		p.dumpRequest(systemHash, body)
 
-		fresh := false
-
-		// Ensure system cache file exists on disk
-		if !cacheFileExists(p.slotSavePath, systemCache) {
+		switch {
+		case !systemCacheFileExists(p.slotSavePath, systemCache):
+			p.eraseCache()
 			p.warmupSystem(req.System, req.Tools)
 			p.saveCache(systemCache)
-			fresh = true
-		}
-
-		if !fresh {
-			switch {
-			case len(req.Messages) > 1:
-				// Continuation: restore model cache
-				p.restoreCache(modelCache)
-			default:
-				// New conversation: restore system cache
-				p.restoreCache(systemCache)
-			}
+		case len(req.Messages) > 1:
+			// Continuation: restore model cache
+			p.restoreCache(modelCache)
+		default:
+			// New conversation: restore system cache
+			p.restoreCache(systemCache)
 		}
 
 		defer p.saveCache(modelCache)
@@ -98,7 +91,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	p.proxy.ServeHTTP(w, r)
 }
 
-func cacheFileExists(slotSavePath, filename string) bool {
+func systemCacheFileExists(slotSavePath, filename string) bool {
 	file := filepath.Join(slotSavePath, filename)
 	slog.Info("test file", "path", file)
 
@@ -166,6 +159,22 @@ func (p *Proxy) warmupSystem(system json.RawMessage, tools json.RawMessage) {
 
 	_, _ = io.Copy(io.Discard, resp.Body)
 	slog.Info("warmup done", "status", resp.StatusCode)
+}
+
+func (p *Proxy) eraseCache() {
+	reqURL := fmt.Sprintf("%s/slots/0?action=erase", p.upstream)
+
+	slog.Info("erase cache", "url", reqURL)
+
+	resp, err := p.client.Post(reqURL, "application/json", nil)
+	if err != nil {
+		slog.Warn("erase restore", "err", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	respBody, _ := io.ReadAll(resp.Body)
+	slog.Info("erase response", "status", resp.StatusCode, "body", string(respBody))
 }
 
 func (p *Proxy) restoreCache(filename string) {
