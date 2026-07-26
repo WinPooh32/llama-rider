@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -8,11 +10,16 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"os/signal"
+	"syscall"
+	"time"
 
 	"github.com/WinPooh32/llama-rider/proxy"
 )
 
 func main() {
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+
 	port := flag.String("port", "8080", "proxy listen port")
 	flag.Parse()
 
@@ -31,11 +38,17 @@ func main() {
 	cmd := exec.Command(llamaArgs[0], llamaArgs[1:]...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
+
+	// Prevent llama-server catch signals from root process
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Setpgid: true,
+		Pgid:    0,
+	}
+
 	if err := cmd.Start(); err != nil {
 		slog.Error("start llama-server", "err", err)
 		os.Exit(1)
 	}
-	defer cmd.Wait()
 
 	slog.Info("proxy started", "upstream", upstream, "alias", llamaAlias, "slotSavePath", slotSavePath, "dumpDir", dumpDir)
 
@@ -44,10 +57,51 @@ func main() {
 
 	addr := fmt.Sprintf(":%s", *port)
 	slog.Info("proxy listening", "addr", addr)
-	if err := http.ListenAndServe(addr, mux); err != nil {
-		slog.Error("server", "err", err)
-		os.Exit(1)
+
+	srv := &http.Server{
+		Addr:    addr,
+		Handler: mux,
 	}
+
+	done := make(chan struct{})
+
+	go func() {
+		defer stop()
+
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			slog.Error("server", "err", err)
+		}
+	}()
+
+	go func() {
+		defer stop()
+
+		if err := cmd.Wait(); err != nil {
+			slog.Error("wait llama-server", "err", err)
+		}
+	}()
+
+	go func() {
+		defer close(done)
+
+		<-ctx.Done()
+		slog.Info("got exit signal")
+
+		slog.Info("stopping http server")
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			slog.Warn("http shutdown is timed out", "err", err)
+		}
+
+		slog.Info("send exit signal to llama-server")
+		if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
+			slog.Error("signal llama-server to quit", "err", err)
+		}
+	}()
+
+	<-done
 }
 
 func extractArg(args []string, name string) string {

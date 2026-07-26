@@ -12,15 +12,18 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sync"
 )
 
 type Proxy struct {
-	proxy        *httputil.ReverseProxy
-	upstream     string
-	model        string
-	slotSavePath string
-	dumpDir      string
-	client       http.Client
+	proxy          *httputil.ReverseProxy
+	upstream       string
+	model          string
+	slotSavePath   string
+	dumpDir        string
+	client         http.Client
+	mut            *sync.Mutex
+	modelCacheName string
 }
 
 func New(upstream *url.URL, model, slotSavePath, dumpDir string) *Proxy {
@@ -30,6 +33,7 @@ func New(upstream *url.URL, model, slotSavePath, dumpDir string) *Proxy {
 		model:        model,
 		slotSavePath: slotSavePath,
 		dumpDir:      dumpDir,
+		mut:          new(sync.Mutex),
 	}
 }
 
@@ -43,6 +47,9 @@ type requestBody struct {
 }
 
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	p.mut.Lock()
+	defer p.mut.Unlock()
+
 	slog.Info("proxy", "method", r.Method, "path", r.URL.Path, "upstream", p.upstream)
 
 	if p.model != "" && r.URL.Path == "/v1/messages" {
@@ -61,10 +68,10 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		modelCache := p.model + ".bin"
+		modelCache := p.model + "--chat.bin"
 		systemHash := hashSystem(req.System, req.Tools)
-		systemCache := fmt.Sprintf("%s----%x.bin", p.model, systemHash)
-
+		systemCache := fmt.Sprintf("%s--system--%x.bin", p.model, systemHash)
+		switchedModel := p.modelCacheName != modelCache
 		p.dumpRequest(systemHash, body)
 
 		switch {
@@ -72,18 +79,19 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			p.eraseCache()
 			p.warmupSystem(req.System, req.Tools)
 			p.saveCache(systemCache)
-		case len(req.Messages) > 1:
+		case switchedModel && len(req.Messages) > 1:
 			// Continuation: restore model cache
 			p.restoreCache(modelCache)
-		default:
+		case switchedModel:
 			// New conversation: restore system cache
 			p.restoreCache(systemCache)
 		}
 
-		defer p.saveCache(modelCache)
-
 		r.Body = io.NopCloser(bytes.NewReader(body))
 		p.proxy.ServeHTTP(w, r)
+
+		p.saveCache(modelCache)
+		p.modelCacheName = modelCache
 
 		return
 	}
