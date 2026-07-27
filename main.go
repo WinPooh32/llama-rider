@@ -53,7 +53,8 @@ func main() {
 	slog.Info("proxy started", "upstream", upstream, "alias", llamaAlias, "slotSavePath", slotSavePath, "dumpDir", dumpDir)
 
 	mux := http.NewServeMux()
-	mux.Handle("/", proxy.New(upstream, llamaAlias, slotSavePath, dumpDir))
+	prx := proxy.New(upstream, llamaAlias, slotSavePath, dumpDir, ctx.Done())
+	mux.Handle("/", prx)
 
 	addr := fmt.Sprintf(":%s", *port)
 	slog.Info("proxy listening", "addr", addr)
@@ -81,6 +82,8 @@ func main() {
 	go func() {
 		<-ctx.Done()
 		slog.Info("got exit signal")
+
+		prx.SaveChatCache()
 
 		slog.Info("stopping http server")
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)

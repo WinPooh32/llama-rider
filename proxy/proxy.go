@@ -25,9 +25,10 @@ type Proxy struct {
 	client         *http.Client
 	mut            *sync.Mutex
 	modelCacheName string
+	closeCh        <-chan struct{}
 }
 
-func New(upstream *url.URL, model, slotSavePath, dumpDir string) *Proxy {
+func New(upstream *url.URL, model, slotSavePath, dumpDir string, closeCh <-chan struct{}) *Proxy {
 	return &Proxy{
 		proxy:        httputil.NewSingleHostReverseProxy(upstream),
 		upstream:     upstream.String(),
@@ -94,13 +95,33 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		r.Body = io.NopCloser(bytes.NewReader(body))
 		p.proxy.ServeHTTP(w, r)
 
-		p.saveCache(modelCache)
+		select {
+		case <-p.closeCh:
+			// Save chat cache only on close signal
+			p.saveCache(modelCache)
+		default:
+		}
+
 		p.modelCacheName = modelCache
 
 		return
 	}
 
 	p.proxy.ServeHTTP(w, r)
+}
+
+func (p *Proxy) SaveChatCache() {
+	if !p.mut.TryLock() {
+		// Request should save chat cache on exit.
+		return
+	}
+	defer p.mut.Unlock()
+
+	if p.modelCacheName == "" {
+		return
+	}
+
+	p.saveCache(p.modelCacheName)
 }
 
 func systemCacheFileExists(slotSavePath, filename string) bool {
