@@ -12,14 +12,56 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
 
+type Content struct {
+	Type string `json:"type"`
+	Text string `json:"text"`
+}
+
+type Contents []Content
+
+func (c *Contents) UnmarshalJSON(data []byte) error {
+	if string(data) == "null" {
+		return nil
+	}
+
+	if bytes.HasPrefix(data, []byte("\"")) {
+		var s string
+		if err := json.Unmarshal(data, &s); err != nil {
+			return err
+		}
+
+		*c = Contents{{
+			Type: "text",
+			Text: s,
+		}}
+
+		return nil
+	}
+
+	var cc []Content
+	if err := json.Unmarshal(data, &cc); err != nil {
+		return err
+	}
+
+	*c = cc
+
+	return nil
+}
+
+type Message struct {
+	Role    string   `json:"role"`
+	Content Contents `json:"content"`
+}
+
 type Proxy struct {
 	proxy          *httputil.ReverseProxy
 	upstream       string
-	model          string
+	baseModel      string
 	slotSavePath   string
 	dumpDir        string
 	client         *http.Client
@@ -32,7 +74,7 @@ func New(upstream *url.URL, model, slotSavePath, dumpDir string, closeCh <-chan 
 	return &Proxy{
 		proxy:        httputil.NewSingleHostReverseProxy(upstream),
 		upstream:     upstream.String(),
-		model:        model,
+		baseModel:    model,
 		slotSavePath: slotSavePath,
 		dumpDir:      dumpDir,
 		mut:          new(sync.Mutex),
@@ -43,12 +85,12 @@ func New(upstream *url.URL, model, slotSavePath, dumpDir string, closeCh <-chan 
 }
 
 type requestBody struct {
-	System    json.RawMessage   `json:"system"`
-	Tools     json.RawMessage   `json:"tools"`
-	Messages  []json.RawMessage `json:"messages"`
-	Model     string            `json:"model"`
-	MaxTokens int               `json:"max_tokens"`
-	Stream    bool              `json:"stream"`
+	System    json.RawMessage `json:"system"`
+	Tools     json.RawMessage `json:"tools"`
+	Messages  []Message       `json:"messages"`
+	Model     string          `json:"model"`
+	MaxTokens int             `json:"max_tokens"`
+	Stream    bool            `json:"stream"`
 }
 
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -57,7 +99,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	slog.Info("proxy", "method", r.Method, "path", r.URL.Path, "upstream", p.upstream)
 
-	if p.model != "" && r.URL.Path == "/v1/messages" {
+	if p.baseModel != "" && r.URL.Path == "/v1/messages" {
 		body, err := io.ReadAll(r.Body)
 		if err != nil {
 			slog.Error("read body", "err", err)
@@ -73,21 +115,33 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		modelCache := p.model + "--chat.bin"
-		systemHash := hashSystem(req.System, req.Tools)
-		systemCache := fmt.Sprintf("%s--system--%x.bin", p.model, systemHash)
+		instructions := instructMessages(req.Messages)
+
+		modelCache := req.Model + "--chat.bin"
+		systemHash := hashSystem(req.System, req.Tools, instructions)
+		systemCache := fmt.Sprintf("%s--system--%x.bin", req.Model, systemHash)
 		switchedModel := p.modelCacheName != modelCache
 		p.dumpRequest(systemHash, body)
 
 		switch {
 		case !systemCacheFileExists(p.slotSavePath, systemCache):
 			p.eraseCache()
-			p.warmupSystem(req.System, req.Tools)
+			p.warmupSystem(req.System, req.Tools, instructions)
 			p.saveCache(systemCache)
-		case switchedModel && len(req.Messages) > 1:
+		case switchedModel && !onlyUser(req.Messages):
+			if p.modelCacheName != "" {
+				// Save current model state.
+				p.saveCache(p.modelCacheName)
+				p.eraseCache()
+			}
 			// Continuation: restore model cache
 			p.restoreCache(modelCache)
 		case switchedModel:
+			if p.modelCacheName != "" {
+				// Save current model state.
+				p.saveCache(p.modelCacheName)
+				p.eraseCache()
+			}
 			// New conversation: restore system cache
 			p.restoreCache(systemCache)
 		}
@@ -124,7 +178,36 @@ func (p *Proxy) SaveChatCache() {
 	p.saveCache(p.modelCacheName)
 }
 
+func onlyUser(messages []Message) bool {
+	for _, m := range messages {
+		if m.Role != "user" {
+			return false
+		}
+	}
+
+	return true
+}
+
+func instructMessages(messages []Message) []Content {
+	if len(messages) != 1 {
+		return nil
+	}
+
+	var contents []Content
+
+	for _, m := range messages {
+		contents = append(contents, m.Content...)
+	}
+
+	if len(contents) <= 1 {
+		return nil
+	}
+
+	return contents[0 : len(contents)-1]
+}
+
 func systemCacheFileExists(slotSavePath, filename string) bool {
+	filename = escapeFilename(filename)
 	file := filepath.Join(slotSavePath, filename)
 	slog.Info("test file", "path", file)
 
@@ -135,8 +218,11 @@ func systemCacheFileExists(slotSavePath, filename string) bool {
 	return info.Size() > 0
 }
 
-func hashSystem(system json.RawMessage, tools json.RawMessage) uint32 {
+func hashSystem(system json.RawMessage, tools json.RawMessage, instructions []Content) uint32 {
+	instrs, _ := json.Marshal(&instructions)
+
 	h := fnv.New32a()
+	h.Write(instrs)
 	h.Write(system)
 	h.Write(tools)
 	return h.Sum32()
@@ -150,7 +236,8 @@ func hashRequest(body []byte) uint32 {
 
 func (p *Proxy) dumpRequest(systemHash uint32, body []byte) {
 	reqHash := hashRequest(body)
-	filename := fmt.Sprintf("%s----%x----%x.json", p.model, systemHash, reqHash)
+	filename := fmt.Sprintf("%s----%x----%x.json", p.baseModel, systemHash, reqHash)
+	filename = escapeFilename(filename)
 	filepath := filepath.Join(p.dumpDir, filename)
 
 	if err := os.MkdirAll(p.dumpDir, 0755); err != nil {
@@ -163,15 +250,25 @@ func (p *Proxy) dumpRequest(systemHash uint32, body []byte) {
 	}
 }
 
-func (p *Proxy) warmupSystem(system json.RawMessage, tools json.RawMessage) {
-	slog.Info("warmup system", "model", p.model)
+func (p *Proxy) warmupSystem(system json.RawMessage, tools json.RawMessage, contents []Content) {
+	slog.Info("warmup system", "model", p.baseModel)
+
+	var messages []Message
+	if len(contents) == 0 {
+		messages = []Message{{Role: "user", Content: Contents{{
+			Type: "text",
+			Text: "",
+		}}}}
+	} else {
+		messages = []Message{{Role: "user", Content: contents}}
+	}
 
 	payload := map[string]any{
-		"model":      p.model,
+		"model":      p.baseModel,
 		"max_tokens": 0,
 		"system":     system,
 		"stream":     false,
-		"messages":   []map[string]string{},
+		"messages":   messages,
 	}
 	if len(tools) > 0 {
 		payload["tools"] = tools
@@ -211,6 +308,7 @@ func (p *Proxy) eraseCache() {
 }
 
 func (p *Proxy) restoreCache(filename string) {
+	filename = escapeFilename(filename)
 	reqURL := fmt.Sprintf("%s/slots/0?action=restore", p.upstream)
 
 	slog.Info("restore cache", "url", reqURL, "filename", filename)
@@ -228,6 +326,7 @@ func (p *Proxy) restoreCache(filename string) {
 }
 
 func (p *Proxy) saveCache(filename string) {
+	filename = escapeFilename(filename)
 	for range 3 {
 		reqURL := fmt.Sprintf("%s/slots/0?action=save", p.upstream)
 
@@ -246,4 +345,8 @@ func (p *Proxy) saveCache(filename string) {
 
 		break
 	}
+}
+
+func escapeFilename(name string) string {
+	return strings.ReplaceAll(name, ":", "--")
 }
