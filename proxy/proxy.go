@@ -17,6 +17,18 @@ import (
 	"time"
 )
 
+const (
+	messagesPath         = "/v1/messages"
+	slotPath             = "/slots/0"
+	jsonContentType      = "application/json"
+	chatCacheSuffix      = "--chat.bin"
+	systemCacheSeparator = "--system--"
+
+	maxSaveRetries = 3
+
+	defaultClientTimeout = 120 * time.Second
+)
+
 type Content struct {
 	Type string `json:"type"`
 	Text string `json:"text"`
@@ -58,29 +70,34 @@ type Message struct {
 	Content Contents `json:"content"`
 }
 
+// Proxy is an HTTP reverse proxy that intercepts llama-server requests
+// to manage KV-cache disk offload. It saves and restores model state
+// to/from the filesystem based on model switches and conversation context.
 type Proxy struct {
-	proxy          *httputil.ReverseProxy
-	upstream       string
+	reverseProxy   *httputil.ReverseProxy
+	upstreamURL    string
 	baseModel      string
 	slotSavePath   string
-	dumpDir        string
+	dumpDirectory  string
 	client         *http.Client
-	mut            *sync.Mutex
+	mu             sync.Mutex
 	modelCacheName string
 	closeCh        <-chan struct{}
 }
 
+// New creates a new Proxy that forwards requests to the given upstream URL
+// and manages KV-cache files in slotSavePath.
 func New(upstream *url.URL, model, slotSavePath, dumpDir string, closeCh <-chan struct{}) *Proxy {
 	return &Proxy{
-		proxy:        httputil.NewSingleHostReverseProxy(upstream),
-		upstream:     upstream.String(),
-		baseModel:    model,
-		slotSavePath: slotSavePath,
-		dumpDir:      dumpDir,
-		mut:          new(sync.Mutex),
+		reverseProxy:  httputil.NewSingleHostReverseProxy(upstream),
+		upstreamURL:   upstream.String(),
+		baseModel:     model,
+		slotSavePath:  slotSavePath,
+		dumpDirectory: dumpDir,
 		client: &http.Client{
-			Timeout: 120 * time.Second,
+			Timeout: defaultClientTimeout,
 		},
+		closeCh: closeCh,
 	}
 }
 
@@ -93,90 +110,45 @@ type requestBody struct {
 	Stream    bool            `json:"stream"`
 }
 
+// ServeHTTP implements http.Handler. It intercepts llama-server requests
+// to manage KV-cache state: saving before model switches, restoring
+// previously-warmed caches, and forwarding requests to the upstream.
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	p.mut.Lock()
-	defer p.mut.Unlock()
+	p.mu.Lock()
+	defer p.mu.Unlock()
 
-	slog.Info("proxy", "method", r.Method, "path", r.URL.Path, "upstream", p.upstream)
+	slog.Info("proxy", "method", r.Method, "path", r.URL.Path, "upstream", p.upstreamURL)
 
-	if p.baseModel != "" && r.URL.Path == "/v1/messages" {
-		body, err := io.ReadAll(r.Body)
-		if err != nil {
-			slog.Error("read body", "err", err)
-			p.proxy.ServeHTTP(w, r)
-			return
-		}
-
-		var req requestBody
-		if err := json.Unmarshal(body, &req); err != nil {
-			slog.Error("parse body", "err", err)
-			r.Body = io.NopCloser(bytes.NewReader(body))
-			p.proxy.ServeHTTP(w, r)
-			return
-		}
-
-		instructions := instructMessages(req.Messages)
-
-		modelCache := req.Model + "--chat.bin"
-		systemHash := hashSystem(req.System, req.Tools, instructions)
-		systemCache := fmt.Sprintf("%s--system--%x.bin", req.Model, systemHash)
-		switchedModel := p.modelCacheName != modelCache
-		p.dumpRequest(systemHash, body)
-
-		switch {
-		case !systemCacheFileExists(p.slotSavePath, systemCache):
-			if p.modelCacheName != "" {
-				// Save current model state before switch.
-				p.saveCache(p.modelCacheName)
-			}
-
-			p.eraseCache()
-			p.warmupSystem(req.System, req.Tools, instructions)
-			p.saveCache(systemCache)
-		case switchedModel && !onlyUser(req.Messages):
-			if p.modelCacheName != "" {
-				// Save current model state before switch.
-				p.saveCache(p.modelCacheName)
-			}
-
-			// Continuation: restore model cache
-			p.restoreCache(modelCache)
-		case switchedModel:
-			if p.modelCacheName != "" {
-				// Save current model state before switch.
-				p.saveCache(p.modelCacheName)
-			}
-
-			// New conversation: restore system cache
-			p.restoreCache(systemCache)
-		default:
-			// Not model switch and not new chat
-		}
-
-		r.Body = io.NopCloser(bytes.NewReader(body))
-		p.proxy.ServeHTTP(w, r)
-
-		select {
-		case <-p.closeCh:
-			// Save chat cache only on close signal
-			p.saveCache(modelCache)
-		default:
-		}
-
-		p.modelCacheName = modelCache
-
+	if p.baseModel == "" || r.URL.Path != messagesPath {
+		p.reverseProxy.ServeHTTP(w, r)
 		return
 	}
 
-	p.proxy.ServeHTTP(w, r)
+	body, err := p.readRequestBody(r)
+	if err != nil {
+		slog.Error("read body", "err", err)
+		p.reverseProxy.ServeHTTP(w, r)
+		return
+	}
+
+	action, req := p.determineCacheAction(body)
+	p.executeCacheAction(action, req)
+
+	r.Body = io.NopCloser(bytes.NewReader(body))
+	p.reverseProxy.ServeHTTP(w, r)
+
+	p.saveOnClose(action.modelCache)
+	p.modelCacheName = action.modelCache
 }
 
+// SaveChatCache saves the current model's chat cache. It uses TryLock
+// to avoid blocking an in-progress request; if the lock is held, the
+// request handler will save on its own exit.
 func (p *Proxy) SaveChatCache() {
-	if !p.mut.TryLock() {
-		// Request should save chat cache on exit.
+	if !p.mu.TryLock() {
 		return
 	}
-	defer p.mut.Unlock()
+	defer p.mu.Unlock()
 
 	if p.modelCacheName == "" {
 		return
@@ -185,75 +157,109 @@ func (p *Proxy) SaveChatCache() {
 	p.saveCache(p.modelCacheName)
 }
 
-func onlyUser(messages []Message) bool {
-	for _, m := range messages {
-		if m.Role != "user" {
-			return false
-		}
-	}
-
-	return true
+// readRequestBody reads the request body and returns it as bytes.
+func (p *Proxy) readRequestBody(r *http.Request) ([]byte, error) {
+	return io.ReadAll(r.Body)
 }
 
-func instructMessages(messages []Message) []Content {
-	if len(messages) != 1 {
-		return nil
-	}
-
-	var contents []Content
-
-	for _, m := range messages {
-		contents = append(contents, m.Content...)
-	}
-
-	if len(contents) <= 1 {
-		return nil
-	}
-
-	return contents[0 : len(contents)-1]
+// cacheAction describes what cache operation to perform for a request.
+type cacheAction struct {
+	modelCache    string
+	systemCache   string
+	erase         bool
+	warmup        bool
+	restoreChat   bool
+	restoreSystem bool
+	saveCurrent   bool
 }
 
-func systemCacheFileExists(slotSavePath, filename string) bool {
-	filename = escapeFilename(filename)
-	file := filepath.Join(slotSavePath, filename)
-	slog.Info("test file", "path", file)
+// determineCacheAction reads the request body, computes cache keys,
+// and returns the appropriate cache action along with the parsed request.
+func (p *Proxy) determineCacheAction(body []byte) (cacheAction, *requestBody) {
+	var req requestBody
+	if err := json.Unmarshal(body, &req); err != nil {
+		slog.Error("parse body", "err", err)
+		return cacheAction{}, nil
+	}
 
-	info, err := os.Stat(file)
+	instructions := extractSystemInstructions(req.Messages)
+
+	modelCache := req.Model + chatCacheSuffix
+	systemHash, err := hashSystem(req.System, req.Tools, instructions)
 	if err != nil {
-		return false
+		slog.Warn("hash system", "err", err)
+		return cacheAction{}, &req
 	}
-	return info.Size() > 0
+	systemCache := fmt.Sprintf("%s%s%x.bin", req.Model, systemCacheSeparator, systemHash)
+	switchedModel := p.modelCacheName != modelCache
+
+	action := cacheAction{
+		modelCache:  modelCache,
+		systemCache: systemCache,
+	}
+
+	if !systemCacheFileExists(p.slotSavePath, systemCache) {
+		action.erase = true
+		action.warmup = true
+		action.saveCurrent = true // Save before erasing new system prompt
+	} else if switchedModel && !isUserOnlyConversation(req.Messages) {
+		action.restoreChat = true
+		action.saveCurrent = true // Save before switching model
+	} else if switchedModel {
+		action.restoreSystem = true
+		action.saveCurrent = true // Save before switching model
+	}
+
+	return action, &req
 }
 
-func hashSystem(system json.RawMessage, tools json.RawMessage, instructions []Content) uint32 {
-	instrs, _ := json.Marshal(&instructions)
-
-	h := fnv.New32a()
-	h.Write(instrs)
-	h.Write(system)
-	h.Write(tools)
-	return h.Sum32()
-}
-
-func hashRequest(body []byte) uint32 {
-	h := fnv.New32a()
-	h.Write(body)
-	return h.Sum32()
-}
-
-func (p *Proxy) dumpRequest(systemHash uint32, body []byte) {
-	reqHash := hashRequest(body)
-	filename := fmt.Sprintf("%s----%x----%x.json", p.baseModel, systemHash, reqHash)
-	filename = escapeFilename(filename)
-	filepath := filepath.Join(p.dumpDir, filename)
-
-	if err := os.MkdirAll(p.dumpDir, 0755); err != nil {
-		slog.Warn("create dump dir", "err", err)
+// executeCacheAction performs the save/erase/restore sequence described
+// by the given cache action.
+func (p *Proxy) executeCacheAction(action cacheAction, req *requestBody) {
+	if action.modelCache == "" {
 		return
 	}
 
-	if err := os.WriteFile(filepath, body, 0644); err != nil {
-		slog.Warn("write dump", "filename", filename, "err", err)
+	if action.saveCurrent {
+		p.saveCurrentModelCache()
+	}
+
+	if action.erase {
+		p.eraseCache()
+	}
+
+	if action.warmup && req != nil {
+		instructions := extractSystemInstructions(req.Messages)
+		p.warmupSystem(req.System, req.Tools, instructions)
+		p.saveCache(action.systemCache)
+	}
+
+	if action.restoreChat {
+		p.restoreCache(action.modelCache)
+	}
+
+	if action.restoreSystem {
+		p.restoreCache(action.systemCache)
+	}
+}
+
+// saveCurrentModelCache saves the current model's cache if one exists.
+func (p *Proxy) saveCurrentModelCache() {
+	if p.modelCacheName == "" {
+		return
+	}
+	p.saveCache(p.modelCacheName)
+}
+
+// saveOnClose saves the chat cache when the close signal is received.
+func (p *Proxy) saveOnClose(modelCache string) {
+	if modelCache == "" {
+		return
+	}
+	select {
+	case <-p.closeCh:
+		p.saveCache(modelCache)
+	default:
 	}
 }
 
@@ -287,73 +293,149 @@ func (p *Proxy) warmupSystem(system json.RawMessage, tools json.RawMessage, cont
 		return
 	}
 
-	resp, err := p.client.Post(fmt.Sprintf("%s/v1/messages", p.upstream), "application/json", bytes.NewReader(jsonBody))
+	resp, err := p.client.Post(fmt.Sprintf("%s%s", p.upstreamURL, messagesPath), jsonContentType, bytes.NewReader(jsonBody))
 	if err != nil {
 		slog.Warn("warmup request", "err", err)
 		return
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	_, _ = io.Copy(io.Discard, resp.Body)
 	slog.Info("warmup done", "status", resp.StatusCode)
 }
 
 func (p *Proxy) eraseCache() {
-	reqURL := fmt.Sprintf("%s/slots/0?action=erase", p.upstream)
+	reqURL := fmt.Sprintf("%s%s?action=erase", p.upstreamURL, slotPath)
 
 	slog.Info("erase cache", "url", reqURL)
 
-	resp, err := p.client.Post(reqURL, "application/json", nil)
+	resp, err := p.client.Post(reqURL, jsonContentType, nil)
 	if err != nil {
-		slog.Warn("erase restore", "err", err)
+		slog.Warn("erase cache", "err", err)
 		return
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
-	respBody, _ := io.ReadAll(resp.Body)
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		slog.Warn("read erase response", "err", err)
+		return
+	}
 	slog.Info("erase response", "status", resp.StatusCode, "body", string(respBody))
 }
 
 func (p *Proxy) restoreCache(filename string) {
-	filename = escapeFilename(filename)
-	reqURL := fmt.Sprintf("%s/slots/0?action=restore", p.upstream)
+	filename = escapeFilenameInline(filename)
+	reqURL := fmt.Sprintf("%s%s?action=restore", p.upstreamURL, slotPath)
 
 	slog.Info("restore cache", "url", reqURL, "filename", filename)
 
 	reqBody := fmt.Appendf(nil, `{"filename":%q}`, filename)
-	resp, err := p.client.Post(reqURL, "application/json", bytes.NewReader(reqBody))
+	resp, err := p.client.Post(reqURL, jsonContentType, bytes.NewReader(reqBody))
 	if err != nil {
 		slog.Warn("cache restore", "filename", filename, "err", err)
 		return
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
-	respBody, _ := io.ReadAll(resp.Body)
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		slog.Warn("read restore response", "err", err)
+		return
+	}
 	slog.Info("restore response", "status", resp.StatusCode, "body", string(respBody))
 }
 
 func (p *Proxy) saveCache(filename string) {
-	filename = escapeFilename(filename)
-	for range 3 {
-		reqURL := fmt.Sprintf("%s/slots/0?action=save", p.upstream)
+	filename = escapeFilenameInline(filename)
+	for range maxSaveRetries {
+		reqURL := fmt.Sprintf("%s%s?action=save", p.upstreamURL, slotPath)
 
 		slog.Info("save cache", "url", reqURL, "filename", filename)
 
 		reqBody := fmt.Appendf(nil, `{"filename":%q}`, filename)
-		resp, err := p.client.Post(reqURL, "application/json", bytes.NewReader(reqBody))
+		resp, err := p.client.Post(reqURL, jsonContentType, bytes.NewReader(reqBody))
 		if err != nil {
 			slog.Warn("cache save", "filename", filename, "err", err)
 			continue
 		}
-		defer resp.Body.Close()
+		defer func() { _ = resp.Body.Close() }()
 
-		respBody, _ := io.ReadAll(resp.Body)
+		respBody, err := io.ReadAll(resp.Body)
+		if err != nil {
+			slog.Warn("read save response", "err", err)
+			continue
+		}
 		slog.Info("save response", "status", resp.StatusCode, "body", string(respBody))
 
 		break
 	}
 }
 
-func escapeFilename(name string) string {
+// escapeFilenameInline replaces colons with double-dashes to avoid filesystem issues.
+// Inlined because it's a trivial single-use transformation.
+func escapeFilenameInline(name string) string {
 	return strings.ReplaceAll(name, ":", "--")
+}
+
+// isUserOnlyConversation returns true if all messages in the conversation are from the user.
+func isUserOnlyConversation(messages []Message) bool {
+	for _, m := range messages {
+		if m.Role != "user" {
+			return false
+		}
+	}
+	return true
+}
+
+// extractSystemInstructions extracts system instruction messages from a conversation.
+// Returns all but the last content block from a single-message conversation.
+func extractSystemInstructions(messages []Message) []Content {
+	if len(messages) != 1 {
+		return nil
+	}
+
+	var contents []Content
+	for _, m := range messages {
+		contents = append(contents, m.Content...)
+	}
+
+	if len(contents) <= 1 {
+		return nil
+	}
+
+	return contents[0 : len(contents)-1]
+}
+
+func systemCacheFileExists(slotSavePath, filename string) bool {
+	filename = escapeFilenameInline(filename)
+	file := filepath.Join(slotSavePath, filename)
+	slog.Info("test file", "path", file)
+
+	info, err := os.Stat(file)
+	if err != nil {
+		return false
+	}
+	return info.Size() > 0
+}
+
+// hashSystem computes an FNV-32a hash of system prompt, tools, and instructions.
+// Returns an error if instructions cannot be marshaled to JSON.
+func hashSystem(system json.RawMessage, tools json.RawMessage, instructions []Content) (uint32, error) {
+	instrs, err := json.Marshal(&instructions)
+	if err != nil {
+		return 0, fmt.Errorf("marshal instructions: %w", err)
+	}
+
+	h := fnv.New32a()
+	h.Write(instrs)
+	h.Write(system)
+	h.Write(tools)
+	return h.Sum32(), nil
+}
+
+func hashRequest(body []byte) uint32 {
+	h := fnv.New32a()
+	h.Write(body)
+	return h.Sum32()
 }

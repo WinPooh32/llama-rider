@@ -33,7 +33,11 @@ func main() {
 	llamaAlias := extractArg(llamaArgs, "alias")
 	slotSavePath := extractArg(llamaArgs, "slot-save-path")
 	dumpDir := "dumps"
-	upstream, _ := url.Parse(fmt.Sprintf("http://127.0.0.1:%s", llamaPort))
+	upstream, err := url.Parse(fmt.Sprintf("http://127.0.0.1:%s", llamaPort))
+	if err != nil {
+		slog.Error("parse upstream URL", "err", err)
+		os.Exit(1)
+	}
 
 	cmd := exec.Command(llamaArgs[0], llamaArgs[1:]...)
 	cmd.Stdout = os.Stdout
