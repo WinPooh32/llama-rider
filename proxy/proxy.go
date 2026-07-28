@@ -125,25 +125,32 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 		switch {
 		case !systemCacheFileExists(p.slotSavePath, systemCache):
+			if p.modelCacheName != "" {
+				// Save current model state before switch.
+				p.saveCache(p.modelCacheName)
+			}
+
 			p.eraseCache()
 			p.warmupSystem(req.System, req.Tools, instructions)
 			p.saveCache(systemCache)
 		case switchedModel && !onlyUser(req.Messages):
 			if p.modelCacheName != "" {
-				// Save current model state.
+				// Save current model state before switch.
 				p.saveCache(p.modelCacheName)
-				p.eraseCache()
 			}
+
 			// Continuation: restore model cache
 			p.restoreCache(modelCache)
 		case switchedModel:
 			if p.modelCacheName != "" {
-				// Save current model state.
+				// Save current model state before switch.
 				p.saveCache(p.modelCacheName)
-				p.eraseCache()
 			}
+
 			// New conversation: restore system cache
 			p.restoreCache(systemCache)
+		default:
+			// Not model switch and not new chat
 		}
 
 		r.Body = io.NopCloser(bytes.NewReader(body))
