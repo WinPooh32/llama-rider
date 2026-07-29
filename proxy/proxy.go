@@ -82,12 +82,11 @@ type Proxy struct {
 	client         *http.Client
 	mu             sync.Mutex
 	modelCacheName string
-	closeCh        <-chan struct{}
 }
 
 // New creates a new Proxy that forwards requests to the given upstream URL
 // and manages KV-cache files in slotSavePath.
-func New(upstream *url.URL, model, slotSavePath, dumpDir string, closeCh <-chan struct{}) *Proxy {
+func New(upstream *url.URL, model, slotSavePath, dumpDir string) *Proxy {
 	return &Proxy{
 		reverseProxy:  httputil.NewSingleHostReverseProxy(upstream),
 		upstreamURL:   upstream.String(),
@@ -97,7 +96,6 @@ func New(upstream *url.URL, model, slotSavePath, dumpDir string, closeCh <-chan 
 		client: &http.Client{
 			Timeout: defaultClientTimeout,
 		},
-		closeCh: closeCh,
 	}
 }
 
@@ -137,17 +135,12 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	r.Body = io.NopCloser(bytes.NewReader(body))
 	p.reverseProxy.ServeHTTP(w, r)
 
-	p.saveOnClose(action.modelCache)
 	p.modelCacheName = action.modelCache
 }
 
-// SaveChatCache saves the current model's chat cache. It uses TryLock
-// to avoid blocking an in-progress request; if the lock is held, the
-// request handler will save on its own exit.
+// SaveChatCache saves the current model's chat cache.
 func (p *Proxy) SaveChatCache() {
-	if !p.mu.TryLock() {
-		return
-	}
+	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	if p.modelCacheName == "" {
@@ -251,18 +244,6 @@ func (p *Proxy) saveCurrentModelCache() {
 	p.saveCache(p.modelCacheName)
 }
 
-// saveOnClose saves the chat cache when the close signal is received.
-func (p *Proxy) saveOnClose(modelCache string) {
-	if modelCache == "" {
-		return
-	}
-	select {
-	case <-p.closeCh:
-		p.saveCache(modelCache)
-	default:
-	}
-}
-
 func (p *Proxy) warmupSystem(system json.RawMessage, tools json.RawMessage, contents []Content) {
 	slog.Info("warmup system", "model", p.baseModel)
 
@@ -300,6 +281,10 @@ func (p *Proxy) warmupSystem(system json.RawMessage, tools json.RawMessage, cont
 	}
 	defer func() { _ = resp.Body.Close() }()
 
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		slog.Warn("warmup response", "status", resp.StatusCode)
+		return
+	}
 	_, _ = io.Copy(io.Discard, resp.Body)
 	slog.Info("warmup done", "status", resp.StatusCode)
 }
@@ -315,6 +300,11 @@ func (p *Proxy) eraseCache() {
 		return
 	}
 	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		slog.Warn("erase cache", "status", resp.StatusCode)
+		return
+	}
 
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -338,6 +328,11 @@ func (p *Proxy) restoreCache(filename string) {
 	}
 	defer func() { _ = resp.Body.Close() }()
 
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		slog.Warn("cache restore", "status", resp.StatusCode)
+		return
+	}
+
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
 		slog.Warn("read restore response", "err", err)
@@ -348,7 +343,7 @@ func (p *Proxy) restoreCache(filename string) {
 
 func (p *Proxy) saveCache(filename string) {
 	filename = escapeFilenameInline(filename)
-	for range maxSaveRetries {
+	for i := 0; i < maxSaveRetries; i++ {
 		reqURL := fmt.Sprintf("%s%s?action=save", p.upstreamURL, slotPath)
 
 		slog.Info("save cache", "url", reqURL, "filename", filename)
@@ -359,9 +354,15 @@ func (p *Proxy) saveCache(filename string) {
 			slog.Warn("cache save", "filename", filename, "err", err)
 			continue
 		}
-		defer func() { _ = resp.Body.Close() }()
+
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			slog.Warn("cache save", "status", resp.StatusCode)
+			resp.Body.Close()
+			continue
+		}
 
 		respBody, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
 		if err != nil {
 			slog.Warn("read save response", "err", err)
 			continue
@@ -434,8 +435,3 @@ func hashSystem(system json.RawMessage, tools json.RawMessage, instructions []Co
 	return h.Sum32(), nil
 }
 
-func hashRequest(body []byte) uint32 {
-	h := fnv.New32a()
-	h.Write(body)
-	return h.Sum32()
-}

@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -29,9 +30,25 @@ func main() {
 		os.Exit(1)
 	}
 
-	llamaPort := extractArg(llamaArgs, "port")
-	llamaAlias := extractArg(llamaArgs, "alias")
-	slotSavePath := extractArg(llamaArgs, "slot-save-path")
+	var err error
+	llamaPort, err := extractArg(llamaArgs, "port")
+	if err != nil {
+		slog.Error("extract arg", "err", err)
+		os.Exit(1)
+	}
+
+	llamaAlias, err := extractArg(llamaArgs, "alias")
+	if err != nil {
+		slog.Error("extract arg", "err", err)
+		os.Exit(1)
+	}
+
+	slotSavePath, err := extractArg(llamaArgs, "slot-save-path")
+	if err != nil {
+		slog.Error("extract arg", "err", err)
+		os.Exit(1)
+	}
+
 	dumpDir := "dumps"
 	upstream, err := url.Parse(fmt.Sprintf("http://127.0.0.1:%s", llamaPort))
 	if err != nil {
@@ -57,7 +74,7 @@ func main() {
 	slog.Info("proxy started", "upstream", upstream, "alias", llamaAlias, "slotSavePath", slotSavePath, "dumpDir", dumpDir)
 
 	mux := http.NewServeMux()
-	prx := proxy.New(upstream, llamaAlias, slotSavePath, dumpDir, ctx.Done())
+	prx := proxy.New(upstream, llamaAlias, slotSavePath, dumpDir)
 	mux.Handle("/", prx)
 
 	addr := fmt.Sprintf(":%s", *port)
@@ -110,13 +127,15 @@ func main() {
 	<-done
 }
 
-func extractArg(args []string, name string) string {
+func extractArg(args []string, name string) (string, error) {
+	prefix := "--" + name + "="
 	for i, arg := range args {
-		if arg == fmt.Sprintf("--%s", name) && i+1 < len(args) {
-			return args[i+1]
+		if arg == "--"+name && i+1 < len(args) {
+			return args[i+1], nil
+		}
+		if val, ok := strings.CutPrefix(arg, prefix); ok {
+			return val, nil
 		}
 	}
-	slog.Error(fmt.Sprintf("could not find --%s in llama-server arguments", name))
-	os.Exit(1)
-	return ""
+	return "", fmt.Errorf("could not find --%s in llama-server arguments", name)
 }
