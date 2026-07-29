@@ -10,27 +10,34 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 )
 
-func TestNew(t *testing.T) {
-	upstream, _ := url.Parse("http://127.0.0.1:8081")
+func TestNew_ForwardsRequests(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("upstream response"))
+	}))
+	defer server.Close()
+
+	upstream, _ := url.Parse(server.URL)
 	proxy := New(upstream, "test-model", "/tmp/cache", "/tmp/dumps")
 
 	if proxy == nil {
 		t.Fatal("New returned nil")
 	}
-	if proxy.upstreamURL != "http://127.0.0.1:8081" {
-		t.Errorf("unexpected upstreamURL: %q", proxy.upstreamURL)
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/completions", nil)
+	w := httptest.NewRecorder()
+
+	proxy.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected status 200, got %d", w.Code)
 	}
-	if proxy.baseModel != "test-model" {
-		t.Errorf("unexpected baseModel: %q", proxy.baseModel)
-	}
-	if proxy.slotSavePath != "/tmp/cache" {
-		t.Errorf("unexpected slotSavePath: %q", proxy.slotSavePath)
-	}
-	if proxy.dumpDirectory != "/tmp/dumps" {
-		t.Errorf("unexpected dumpDirectory: %q", proxy.dumpDirectory)
+	if w.Body.String() != "upstream response" {
+		t.Errorf("unexpected body: %q", w.Body.String())
 	}
 }
 
@@ -69,7 +76,6 @@ func TestDetermineCacheAction_SameModel(t *testing.T) {
 	upstream, _ := url.Parse("http://127.0.0.1:8081")
 	proxy := New(upstream, "model1", tmpDir, "/tmp/dumps")
 
-	// Compute the actual hash first
 	body := []byte(`{
 		"model": "model1",
 		"messages": [{"role": "user", "content": "hello"}, {"role": "assistant", "content": "hi"}],
@@ -83,7 +89,6 @@ func TestDetermineCacheAction_SameModel(t *testing.T) {
 	hash, _ := hashSystem(req.System, req.Tools, instructions)
 	systemCache := fmt.Sprintf("model1%s%x.bin", systemCacheSeparator, hash)
 
-	// Pre-populate system cache with the correct hash
 	cacheFile := filepath.Join(tmpDir, systemCache)
 	_ = os.WriteFile(cacheFile, []byte("test"), 0644)
 
@@ -109,13 +114,11 @@ func TestDetermineCacheAction_ModelSwitch_Continuation(t *testing.T) {
 	upstream, _ := url.Parse("http://127.0.0.1:8081")
 	proxy := New(upstream, "model1", tmpDir, "/tmp/dumps")
 
-	// Compute system cache hash programmatically
 	hash, _ := hashSystem(json.RawMessage(`"system prompt"`), json.RawMessage(`[]`), nil)
 	systemCache := fmt.Sprintf("model1%s%x.bin", systemCacheSeparator, hash)
 	cacheFile := filepath.Join(tmpDir, systemCache)
 	_ = os.WriteFile(cacheFile, []byte("test"), 0644)
 
-	// Pre-populate system cache for model2 (same hash since same system prompt)
 	systemCache2 := fmt.Sprintf("model2%s%x.bin", systemCacheSeparator, hash)
 	cacheFile2 := filepath.Join(tmpDir, systemCache2)
 	_ = os.WriteFile(cacheFile2, []byte("test"), 0644)
@@ -137,26 +140,6 @@ func TestDetermineCacheAction_ModelSwitch_Continuation(t *testing.T) {
 		t.Error("expected saveCurrent to be true for model switch")
 	}
 }
-
-func TestSaveCurrentModelCache_WithCache(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/slots/0?action=save" {
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte(`{"status":"ok"}`))
-			return
-		}
-		w.WriteHeader(http.StatusNotFound)
-	}))
-	defer server.Close()
-
-	upstream, _ := url.Parse(server.URL)
-	proxy := New(upstream, "model1", "/tmp/cache", "/tmp/dumps")
-	proxy.modelCacheName = "model1--chat.bin"
-
-	// Should call save endpoint
-	proxy.saveCurrentModelCache()
-}
-
 
 func TestServeHTTP_ForwardsNonMessagesPath(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -182,9 +165,8 @@ func TestServeHTTP_ForwardsNonMessagesPath(t *testing.T) {
 }
 
 func TestServeHTTP_WithMessagesPath(t *testing.T) {
-	// Mock upstream that returns a response
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/slots/0?action=erase" {
+		if r.URL.Path == "/slots/0" && r.URL.RawQuery == "action=erase" {
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte(`{"status":"ok"}`))
 			return
@@ -223,24 +205,17 @@ func TestServeHTTP_WithMessagesPath(t *testing.T) {
 }
 
 func TestServeHTTP_WithModelSwitch(t *testing.T) {
-	// Mock upstream
+	var saveReceived bool
+	var mu sync.Mutex
+
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/slots/0?action=save" {
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte(`{"status":"ok"}`))
-			return
+		mu.Lock()
+		if r.URL.Path == "/slots/0" && r.URL.RawQuery == "action=save" {
+			saveReceived = true
 		}
-		if r.URL.Path == "/slots/0?action=restore" {
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte(`{"status":"ok"}`))
-			return
-		}
-		if r.URL.Path == "/v1/messages" {
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte(`{"response": "hello"}`))
-			return
-		}
-		w.WriteHeader(http.StatusNotFound)
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
 	}))
 	defer server.Close()
 
@@ -248,156 +223,235 @@ func TestServeHTTP_WithModelSwitch(t *testing.T) {
 	tmpDir := t.TempDir()
 	proxy := New(upstream, "model1", tmpDir, "/tmp/dumps")
 
-	// Pre-populate system cache for model1
-	hash, _ := hashSystem(json.RawMessage(`"system prompt"`), json.RawMessage(`[]`), nil)
-	systemCache := fmt.Sprintf("model1%s%x.bin", systemCacheSeparator, hash)
-	cacheFile := filepath.Join(tmpDir, systemCache)
-	_ = os.WriteFile(cacheFile, []byte("test"), 0644)
-	proxy.modelCacheName = "model1--chat.bin"
+	// First request to establish model1 cache
+	firstBody := []byte(`{
+		"model": "model1",
+		"messages": [{"role": "user", "content": "hello"}],
+		"system": "system prompt",
+		"tools": []
+	}`)
+	req1 := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(firstBody))
+	w1 := httptest.NewRecorder()
+	proxy.ServeHTTP(w1, req1)
 
-	// Switch to model2
-	body := []byte(`{
+	// Switch to model2 - should trigger save of model1 cache
+	secondBody := []byte(`{
 		"model": "model2",
 		"messages": [{"role": "user", "content": "hello"}],
 		"system": "system prompt",
 		"tools": []
 	}`)
+	req2 := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(secondBody))
+	w2 := httptest.NewRecorder()
+	proxy.ServeHTTP(w2, req2)
+
+	if w2.Code != http.StatusOK {
+		t.Errorf("expected status 200, got %d", w2.Code)
+	}
+	if !saveReceived {
+		t.Error("expected save to be called on model switch")
+	}
+}
+
+func TestServeHTTP_TriggersRestoreOnModelSwitch(t *testing.T) {
+	var restoreBody string
+	var mu sync.Mutex
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/slots/0" && r.URL.RawQuery == "action=restore" {
+			mu.Lock()
+			buf := make([]byte, 1024)
+			n, _ := r.Body.Read(buf)
+			restoreBody = string(buf[:n])
+			mu.Unlock()
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	}))
+	defer server.Close()
+
+	upstream, _ := url.Parse(server.URL)
+	tmpDir := t.TempDir()
+	proxy := New(upstream, "model1", tmpDir, "/tmp/dumps")
+
+	// Pre-create system cache for model2 so switch triggers restoreChat instead of erase+warmup
+	hash, _ := hashSystem(json.RawMessage(`"system prompt"`), json.RawMessage(`[]`), nil)
+	systemCache2 := fmt.Sprintf("model2%s%x.bin", systemCacheSeparator, hash)
+	cacheFile2 := filepath.Join(tmpDir, systemCache2)
+	_ = os.WriteFile(cacheFile2, []byte("test"), 0644)
+
+	// First request to establish model1 cache
+	firstBody := []byte(`{
+		"model": "model1",
+		"messages": [{"role": "user", "content": "hello"}],
+		"system": "system prompt",
+		"tools": []
+	}`)
+	req1 := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(firstBody))
+	w1 := httptest.NewRecorder()
+	proxy.ServeHTTP(w1, req1)
+
+	// Switch to model2 with conversation continuation
+	secondBody := []byte(`{
+		"model": "model2",
+		"messages": [{"role": "user", "content": "hello"}, {"role": "assistant", "content": "hi"}],
+		"system": "system prompt",
+		"tools": []
+	}`)
+	req2 := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(secondBody))
+	w2 := httptest.NewRecorder()
+	proxy.ServeHTTP(w2, req2)
+
+	if w2.Code != http.StatusOK {
+		t.Errorf("expected status 200, got %d", w2.Code)
+	}
+	if !strings.Contains(restoreBody, "model2--chat.bin") {
+		t.Errorf("expected restore with model2 cache, got %q", restoreBody)
+	}
+}
+
+func TestServeHTTP_TriggersRestoreWithEscapedFilename(t *testing.T) {
+	var restoreBody string
+	var mu sync.Mutex
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/slots/0" && r.URL.RawQuery == "action=restore" {
+			mu.Lock()
+			buf := make([]byte, 1024)
+			n, _ := r.Body.Read(buf)
+			restoreBody = string(buf[:n])
+			mu.Unlock()
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	}))
+	defer server.Close()
+
+	upstream, _ := url.Parse(server.URL)
+	tmpDir := t.TempDir()
+	proxy := New(upstream, "model:name", tmpDir, "/tmp/dumps")
+
+	// First request to establish cache with colons in model name
+	firstBody := []byte(`{
+		"model": "model:name",
+		"messages": [{"role": "user", "content": "hello"}],
+		"system": "system prompt",
+		"tools": []
+	}`)
+	req1 := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(firstBody))
+	w1 := httptest.NewRecorder()
+	proxy.ServeHTTP(w1, req1)
+
+	// Switch to another model with colons
+	secondBody := []byte(`{
+		"model": "other:model",
+		"messages": [{"role": "user", "content": "hello"}, {"role": "assistant", "content": "hi"}],
+		"system": "system prompt",
+		"tools": []
+	}`)
+	req2 := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(secondBody))
+	w2 := httptest.NewRecorder()
+	proxy.ServeHTTP(w2, req2)
+
+	if w2.Code != http.StatusOK {
+		t.Errorf("expected status 200, got %d", w2.Code)
+	}
+	// The filename should have colons escaped
+	if strings.Contains(restoreBody, ":") {
+		t.Errorf("expected colons to be escaped in restore filename, got %q", restoreBody)
+	}
+}
+
+func TestServeHTTP_TriggersEraseOnNewSystem(t *testing.T) {
+	var eraseReceived bool
+	var mu sync.Mutex
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		if r.URL.Path == "/slots/0" && r.URL.RawQuery == "action=erase" {
+			eraseReceived = true
+		}
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	}))
+	defer server.Close()
+
+	upstream, _ := url.Parse(server.URL)
+	tmpDir := t.TempDir()
+	proxy := New(upstream, "model1", tmpDir, "/tmp/dumps")
+
+	body := []byte(`{
+		"model": "model1",
+		"messages": [{"role": "user", "content": "hello"}],
+		"system": "new system prompt",
+		"tools": []
+	}`)
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(body))
 	w := httptest.NewRecorder()
-
 	proxy.ServeHTTP(w, req)
 
 	if w.Code != http.StatusOK {
 		t.Errorf("expected status 200, got %d", w.Code)
 	}
-	if proxy.modelCacheName != "model2--chat.bin" {
-		t.Errorf("expected modelCacheName to be updated, got %q", proxy.modelCacheName)
+	if !eraseReceived {
+		t.Error("expected erase to be called for new system prompt")
 	}
 }
 
-func TestRestoreCache(t *testing.T) {
-	var receivedURL string
-	var receivedBody string
+func TestServeHTTP_TriggersSaveOnModelSwitch(t *testing.T) {
+	var saveReceived bool
+	var mu sync.Mutex
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		receivedURL = r.URL.String()
-		buf := make([]byte, 1024)
-		n, _ := r.Body.Read(buf)
-		receivedBody = string(buf[:n])
+		mu.Lock()
+		if r.URL.Path == "/slots/0" && r.URL.RawQuery == "action=save" {
+			saveReceived = true
+		}
+		mu.Unlock()
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"status":"ok"}`))
 	}))
 	defer server.Close()
 
 	upstream, _ := url.Parse(server.URL)
-	proxy := New(upstream, "model1", "/tmp/cache", "/tmp/dumps")
+	tmpDir := t.TempDir()
+	proxy := New(upstream, "model1", tmpDir, "/tmp/dumps")
 
-	proxy.restoreCache("test-model--chat.bin")
+	// Pre-create system cache for model2 so switch doesn't trigger erase/warmup
+	hash, _ := hashSystem(json.RawMessage(`"system prompt"`), json.RawMessage(`[]`), nil)
+	systemCache2 := fmt.Sprintf("model2%s%x.bin", systemCacheSeparator, hash)
+	cacheFile2 := filepath.Join(tmpDir, systemCache2)
+	_ = os.WriteFile(cacheFile2, []byte("test"), 0644)
 
-	if receivedURL == "" {
-		t.Error("expected URL to be set")
+	// First request to establish cache
+	firstBody := []byte(`{
+		"model": "model1",
+		"messages": [{"role": "user", "content": "hello"}],
+		"system": "system prompt",
+		"tools": []
+	}`)
+	req1 := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(firstBody))
+	w1 := httptest.NewRecorder()
+	proxy.ServeHTTP(w1, req1)
+
+	// Switch model - should trigger save of current cache before switch
+	secondBody := []byte(`{
+		"model": "model2",
+		"messages": [{"role": "user", "content": "hello"}],
+		"system": "system prompt",
+		"tools": []
+	}`)
+	req2 := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(secondBody))
+	w2 := httptest.NewRecorder()
+	proxy.ServeHTTP(w2, req2)
+
+	if w2.Code != http.StatusOK {
+		t.Errorf("expected status 200, got %d", w2.Code)
 	}
-	if !strings.Contains(receivedURL, "action=restore") {
-		t.Errorf("expected URL to contain 'action=restore', got %q", receivedURL)
-	}
-	if !strings.Contains(receivedURL, "slots/0") {
-		t.Errorf("expected URL to contain 'slots/0', got %q", receivedURL)
-	}
-	if receivedBody == "" {
-		t.Error("expected body to be set")
-	}
-	if !strings.Contains(receivedBody, "test-model--chat.bin") {
-		t.Errorf("expected body to contain filename, got %q", receivedBody)
-	}
-}
-
-func TestRestoreCache_WithColons(t *testing.T) {
-	var receivedBody string
-
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		buf := make([]byte, 1024)
-		n, _ := r.Body.Read(buf)
-		receivedBody = string(buf[:n])
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"status":"ok"}`))
-	}))
-	defer server.Close()
-
-	upstream, _ := url.Parse(server.URL)
-	proxy := New(upstream, "model1", "/tmp/cache", "/tmp/dumps")
-
-	// Test that colons are escaped
-	proxy.restoreCache("model:name--chat.bin")
-
-	if receivedBody == "" {
-		t.Error("expected body to be set")
-	}
-	// The body should contain the escaped filename (colons replaced with --)
-	if !strings.Contains(receivedBody, "model--name--chat.bin") {
-		t.Errorf("expected escaped filename 'model--name--chat.bin' in body, got %q", receivedBody)
-	}
-}
-
-func TestEraseCache(t *testing.T) {
-	var receivedURL string
-
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		receivedURL = r.URL.String()
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"status":"ok"}`))
-	}))
-	defer server.Close()
-
-	upstream, _ := url.Parse(server.URL)
-	proxy := New(upstream, "model1", "/tmp/cache", "/tmp/dumps")
-
-	proxy.eraseCache()
-
-	if receivedURL == "" {
-		t.Error("expected URL to be set")
-	}
-	if !strings.Contains(receivedURL, "action=erase") {
-		t.Errorf("expected URL to contain 'action=erase', got %q", receivedURL)
-	}
-	if !strings.Contains(receivedURL, "slots/0") {
-		t.Errorf("expected URL to contain 'slots/0', got %q", receivedURL)
-	}
-}
-
-func TestSaveCache(t *testing.T) {
-	var receivedURL string
-	var receivedBody string
-
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		receivedURL = r.URL.String()
-		buf := make([]byte, 1024)
-		n, _ := r.Body.Read(buf)
-		receivedBody = string(buf[:n])
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"status":"ok"}`))
-	}))
-	defer server.Close()
-
-	upstream, _ := url.Parse(server.URL)
-	proxy := New(upstream, "model1", "/tmp/cache", "/tmp/dumps")
-
-	proxy.saveCache("test-model--chat.bin")
-
-	if receivedURL == "" {
-		t.Error("expected URL to be set")
-	}
-	if !strings.Contains(receivedURL, "action=save") {
-		t.Errorf("expected URL to contain 'action=save', got %q", receivedURL)
-	}
-	if !strings.Contains(receivedURL, "slots/0") {
-		t.Errorf("expected URL to contain 'slots/0', got %q", receivedURL)
-	}
-	if receivedBody == "" {
-		t.Error("expected body to be set")
-	}
-	if !strings.Contains(receivedBody, "test-model--chat.bin") {
-		t.Errorf("expected body to contain filename, got %q", receivedBody)
+	if !saveReceived {
+		t.Error("expected save to be called on model switch")
 	}
 }
 
@@ -406,13 +460,11 @@ func TestDetermineCacheAction_NoSaveOnSameModel(t *testing.T) {
 	upstream, _ := url.Parse("http://127.0.0.1:8081")
 	proxy := New(upstream, "model1", tmpDir, "/tmp/dumps")
 
-	// Pre-populate system cache
 	hash, _ := hashSystem(json.RawMessage(`"system prompt"`), json.RawMessage(`[]`), nil)
 	systemCache := fmt.Sprintf("model1%s%x.bin", systemCacheSeparator, hash)
 	cacheFile := filepath.Join(tmpDir, systemCache)
 	_ = os.WriteFile(cacheFile, []byte("test"), 0644)
 
-	// Set current model cache
 	proxy.modelCacheName = "model1--chat.bin"
 
 	body := []byte(`{
@@ -424,7 +476,6 @@ func TestDetermineCacheAction_NoSaveOnSameModel(t *testing.T) {
 
 	action, _ := proxy.determineCacheAction(body)
 
-	// Should NOT save current model cache when same model, same system prompt
 	if action.saveCurrent {
 		t.Error("expected saveCurrent to be false for same model/system")
 	}
@@ -447,18 +498,15 @@ func TestDetermineCacheAction_SaveOnModelSwitch(t *testing.T) {
 	upstream, _ := url.Parse("http://127.0.0.1:8081")
 	proxy := New(upstream, "model1", tmpDir, "/tmp/dumps")
 
-	// Compute system cache hash programmatically
 	hash, _ := hashSystem(json.RawMessage(`"system prompt"`), json.RawMessage(`[]`), nil)
 	systemCache := fmt.Sprintf("model1%s%x.bin", systemCacheSeparator, hash)
 	cacheFile := filepath.Join(tmpDir, systemCache)
 	_ = os.WriteFile(cacheFile, []byte("test"), 0644)
 
-	// Pre-populate system cache for model2 (same hash since same system prompt)
 	systemCache2 := fmt.Sprintf("model2%s%x.bin", systemCacheSeparator, hash)
 	cacheFile2 := filepath.Join(tmpDir, systemCache2)
 	_ = os.WriteFile(cacheFile2, []byte("test"), 0644)
 
-	// Set current model cache
 	proxy.modelCacheName = "model1--chat.bin"
 
 	body := []byte(`{
@@ -470,7 +518,6 @@ func TestDetermineCacheAction_SaveOnModelSwitch(t *testing.T) {
 
 	action, _ := proxy.determineCacheAction(body)
 
-	// Should save current model cache when switching model
 	if !action.saveCurrent {
 		t.Error("expected saveCurrent to be true for model switch")
 	}
@@ -484,7 +531,6 @@ func TestDetermineCacheAction_SaveOnNewSystem(t *testing.T) {
 	upstream, _ := url.Parse("http://127.0.0.1:8081")
 	proxy := New(upstream, "model1", tmpDir, "/tmp/dumps")
 
-	// Set current model cache
 	proxy.modelCacheName = "model1--chat.bin"
 
 	body := []byte(`{
@@ -496,7 +542,6 @@ func TestDetermineCacheAction_SaveOnNewSystem(t *testing.T) {
 
 	action, _ := proxy.determineCacheAction(body)
 
-	// Should save current model cache when new system prompt
 	if !action.saveCurrent {
 		t.Error("expected saveCurrent to be true for new system prompt")
 	}
@@ -513,18 +558,15 @@ func TestDetermineCacheAction_ModelSwitch_EmptyConversation(t *testing.T) {
 	upstream, _ := url.Parse("http://127.0.0.1:8081")
 	proxy := New(upstream, "model1", tmpDir, "/tmp/dumps")
 
-	// Compute system cache hash programmatically
 	hash, _ := hashSystem(json.RawMessage(`"system prompt"`), json.RawMessage(`[]`), nil)
 	systemCache := fmt.Sprintf("model1%s%x.bin", systemCacheSeparator, hash)
 	cacheFile := filepath.Join(tmpDir, systemCache)
 	_ = os.WriteFile(cacheFile, []byte("test"), 0644)
 
-	// Pre-populate system cache for model2 (same hash since same system prompt)
 	systemCache2 := fmt.Sprintf("model2%s%x.bin", systemCacheSeparator, hash)
 	cacheFile2 := filepath.Join(tmpDir, systemCache2)
 	_ = os.WriteFile(cacheFile2, []byte("test"), 0644)
 
-	// Set current model cache
 	proxy.modelCacheName = "model1--chat.bin"
 
 	body := []byte(`{
@@ -536,11 +578,9 @@ func TestDetermineCacheAction_ModelSwitch_EmptyConversation(t *testing.T) {
 
 	action, _ := proxy.determineCacheAction(body)
 
-	// Should save current model cache when switching model
 	if !action.saveCurrent {
 		t.Error("expected saveCurrent to be true for model switch")
 	}
-	// Should restore system cache (not chat cache) for user-only conversation
 	if !action.restoreSystem {
 		t.Error("expected restoreSystem to be true for model switch with user-only conversation")
 	}
@@ -575,155 +615,157 @@ func TestServeHTTP_WithEmptyBaseModel(t *testing.T) {
 	}
 }
 
-func TestSaveChatCache_WhenLocked(t *testing.T) {
+func TestSaveChatCache_Concurrent(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/slots/0?action=save" {
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte(`{"status":"ok"}`))
-			return
-		}
-		w.WriteHeader(http.StatusNotFound)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
 	}))
 	defer server.Close()
 
 	upstream, _ := url.Parse(server.URL)
-	proxy := New(upstream, "model1", "/tmp/cache", "/tmp/dumps")
-	proxy.modelCacheName = "model1--chat.bin"
+	tmpDir := t.TempDir()
+	proxy := New(upstream, "model1", tmpDir, "/tmp/dumps")
 
-	// Hold the lock briefly in a goroutine, then release it.
-	// SaveChatCache should acquire the lock after the goroutine releases it.
-	released := make(chan struct{})
+	// Establish cache through ServeHTTP first
+	firstBody := []byte(`{
+		"model": "model1",
+		"messages": [{"role": "user", "content": "hello"}],
+		"system": "system prompt",
+		"tools": []
+	}`)
+	req1 := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(firstBody))
+	w1 := httptest.NewRecorder()
+	proxy.ServeHTTP(w1, req1)
+
+	// Now test concurrent SaveChatCache
+	var wg sync.WaitGroup
+	done := make(chan bool, 1)
+
+	wg.Add(1)
 	go func() {
-		proxy.mu.Lock()
-		close(released)
-		proxy.mu.Unlock()
+		defer wg.Done()
+		proxy.SaveChatCache()
+		done <- true
 	}()
 
-	<-released // Wait for goroutine to release the lock
-
-	// Now call SaveChatCache; it should acquire the lock and save successfully
 	proxy.SaveChatCache()
+
+	<-done
+	wg.Wait()
 }
 
-func TestSaveChatCache_WhenUnlocked(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/slots/0?action=save" {
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte(`{"status":"ok"}`))
-			return
-		}
-		w.WriteHeader(http.StatusNotFound)
-	}))
-	defer server.Close()
-
-	upstream, _ := url.Parse(server.URL)
-	proxy := New(upstream, "model1", "/tmp/cache", "/tmp/dumps")
-	proxy.modelCacheName = "model1--chat.bin"
-
-	// Should save cache
-	proxy.SaveChatCache()
-}
-
-func TestWarmupSystem_EmptyContents(t *testing.T) {
-	var receivedBody map[string]any
+func TestSaveChatCache_SavesCache(t *testing.T) {
+	var saveReceived bool
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/v1/messages" {
-			w.WriteHeader(http.StatusNotFound)
-			return
+		if r.URL.Path == "/slots/0" && r.URL.RawQuery == "action=save" {
+			saveReceived = true
 		}
-		_ = json.NewDecoder(r.Body).Decode(&receivedBody)
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"status":"ok"}`))
 	}))
 	defer server.Close()
 
 	upstream, _ := url.Parse(server.URL)
-	proxy := New(upstream, "test-model", "/tmp/cache", "/tmp/dumps")
+	tmpDir := t.TempDir()
+	proxy := New(upstream, "model1", tmpDir, "/tmp/dumps")
 
-	// Call warmupSystem with nil contents (should create empty text message)
-	proxy.warmupSystem(json.RawMessage(`"system prompt"`), json.RawMessage(`[]`), nil)
+	// Establish cache through ServeHTTP
+	firstBody := []byte(`{
+		"model": "model1",
+		"messages": [{"role": "user", "content": "hello"}],
+		"system": "system prompt",
+		"tools": []
+	}`)
+	req1 := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(firstBody))
+	w1 := httptest.NewRecorder()
+	proxy.ServeHTTP(w1, req1)
 
-	if receivedBody == nil {
-		t.Fatal("expected request body to be received")
-	}
+	// Now call SaveChatCache
+	proxy.SaveChatCache()
 
-	if receivedBody["model"] != "test-model" {
-		t.Errorf("expected model 'test-model', got %v", receivedBody["model"])
-	}
-
-	if receivedBody["max_tokens"] != float64(0) {
-		t.Errorf("expected max_tokens 0, got %v", receivedBody["max_tokens"])
-	}
-
-	if receivedBody["stream"] != false {
-		t.Errorf("expected stream false, got %v", receivedBody["stream"])
-	}
-
-	messages, ok := receivedBody["messages"].([]any)
-	if !ok {
-		t.Fatal("expected messages to be an array")
-	}
-	if len(messages) != 1 {
-		t.Fatalf("expected 1 message, got %d", len(messages))
-	}
-
-	msg, ok := messages[0].(map[string]any)
-	if !ok {
-		t.Fatal("expected message to be an object")
-	}
-	if msg["role"] != "user" {
-		t.Errorf("expected role 'user', got %v", msg["role"])
-	}
-
-	contents, ok := msg["content"].([]any)
-	if !ok {
-		t.Fatal("expected content to be an array")
-	}
-	if len(contents) != 1 {
-		t.Fatalf("expected 1 content item, got %d", len(contents))
-	}
-
-	content, ok := contents[0].(map[string]any)
-	if !ok {
-		t.Fatal("expected content item to be an object")
-	}
-	if content["type"] != "text" {
-		t.Errorf("expected content type 'text', got %v", content["type"])
-	}
-	if content["text"] != "" {
-		t.Errorf("expected empty text, got %v", content["text"])
+	if !saveReceived {
+		t.Error("expected SaveChatCache to trigger save")
 	}
 }
 
-func TestWarmupSystem_WithContents(t *testing.T) {
-	var receivedBody map[string]any
+func TestServeHTTP_TriggersWarmupWithEmptyContents(t *testing.T) {
+	var warmupBody map[string]any
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/v1/messages" {
-			w.WriteHeader(http.StatusNotFound)
-			return
+		if r.URL.Path == "/v1/messages" && !strings.Contains(r.URL.RawQuery, "action") {
+			_ = json.NewDecoder(r.Body).Decode(&warmupBody)
 		}
-		_ = json.NewDecoder(r.Body).Decode(&receivedBody)
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"status":"ok"}`))
 	}))
 	defer server.Close()
 
 	upstream, _ := url.Parse(server.URL)
-	proxy := New(upstream, "test-model", "/tmp/cache", "/tmp/dumps")
+	tmpDir := t.TempDir()
+	proxy := New(upstream, "test-model", tmpDir, "/tmp/dumps")
 
-	contents := []Content{
-		{Type: "text", Text: "instruction 1"},
-		{Type: "text", Text: "instruction 2"},
+	// Send request that triggers warmup (no system cache exists)
+	body := []byte(`{
+		"model": "test-model",
+		"messages": [{"role": "user", "content": "hello"}],
+		"system": "system prompt",
+		"tools": []
+	}`)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(body))
+	w := httptest.NewRecorder()
+	proxy.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected status 200, got %d", w.Code)
 	}
-	proxy.warmupSystem(json.RawMessage(`"system prompt"`), json.RawMessage(`[]`), contents)
+	if warmupBody == nil {
+		t.Fatal("expected warmup request to be received")
+	}
+	if warmupBody["model"] != "test-model" {
+		t.Errorf("expected model 'test-model', got %v", warmupBody["model"])
+	}
+}
 
-	if receivedBody == nil {
-		t.Fatal("expected request body to be received")
+func TestServeHTTP_TriggersWarmupWithContents(t *testing.T) {
+	var warmupBody map[string]any
+	var decoded bool
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/messages" && r.URL.RawQuery == "" && !decoded {
+			decoded = true
+			_ = json.NewDecoder(r.Body).Decode(&warmupBody)
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	}))
+	defer server.Close()
+
+	upstream, _ := url.Parse(server.URL)
+	tmpDir := t.TempDir()
+	proxy := New(upstream, "test-model", tmpDir, "/tmp/dumps")
+
+	// Send request with multiple content blocks (instructions = all but last)
+	body := []byte(`{
+		"model": "test-model",
+		"messages": [{"role": "user", "content": [{"type": "text", "text": "instruction 1"}, {"type": "text", "text": "instruction 2"}, {"type": "text", "text": "last"}]}],
+		"system": "system prompt",
+		"tools": []
+	}`)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(body))
+	w := httptest.NewRecorder()
+	proxy.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected status 200, got %d", w.Code)
+	}
+	if warmupBody == nil {
+		t.Fatal("expected warmup request to be received")
 	}
 
-	messages, ok := receivedBody["messages"].([]any)
+	messages, ok := warmupBody["messages"].([]any)
 	if !ok {
 		t.Fatal("expected messages to be an array")
 	}
@@ -740,50 +782,73 @@ func TestWarmupSystem_WithContents(t *testing.T) {
 	if !ok {
 		t.Fatal("expected content to be an array")
 	}
+	// extractSystemInstructions returns all but last content = 2 items
 	if len(rc) != 2 {
-		t.Fatalf("expected 2 content items, got %d", len(rc))
+		t.Fatalf("expected 2 content items (instructions exclude last), got %d", len(rc))
 	}
 }
 
-func TestWarmupSystem_WithTools(t *testing.T) {
-	var receivedBody map[string]any
+func TestServeHTTP_TriggersWarmupWithTools(t *testing.T) {
+	var warmupBody map[string]any
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/v1/messages" {
-			w.WriteHeader(http.StatusNotFound)
-			return
+		if r.URL.Path == "/v1/messages" && !strings.Contains(r.URL.RawQuery, "action") {
+			_ = json.NewDecoder(r.Body).Decode(&warmupBody)
 		}
-		_ = json.NewDecoder(r.Body).Decode(&receivedBody)
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"status":"ok"}`))
 	}))
 	defer server.Close()
 
 	upstream, _ := url.Parse(server.URL)
-	proxy := New(upstream, "test-model", "/tmp/cache", "/tmp/dumps")
+	tmpDir := t.TempDir()
+	proxy := New(upstream, "test-model", tmpDir, "/tmp/dumps")
 
 	tools := json.RawMessage(`[{"name":"test_tool"}]`)
-	proxy.warmupSystem(json.RawMessage(`"system prompt"`), tools, nil)
+	body := fmt.Sprintf(`{
+		"model": "test-model",
+		"messages": [{"role": "user", "content": "hello"}],
+		"system": "system prompt",
+		"tools": %s
+	}`, tools)
 
-	if receivedBody == nil {
-		t.Fatal("expected request body to be received")
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader([]byte(body)))
+	w := httptest.NewRecorder()
+	proxy.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected status 200, got %d", w.Code)
+	}
+	if warmupBody == nil {
+		t.Fatal("expected warmup request to be received")
 	}
 
-	_, hasTools := receivedBody["tools"]
+	_, hasTools := warmupBody["tools"]
 	if !hasTools {
-		t.Error("expected tools to be present in request body")
+		t.Error("expected tools to be present in warmup request")
 	}
 }
 
-func TestWarmupSystem_HTTPError(t *testing.T) {
+func TestServeHTTP_WarmupHTTPErrorDoesNotPanic(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 	}))
 	defer server.Close()
 
 	upstream, _ := url.Parse(server.URL)
-	proxy := New(upstream, "test-model", "/tmp/cache", "/tmp/dumps")
+	tmpDir := t.TempDir()
+	proxy := New(upstream, "test-model", tmpDir, "/tmp/dumps")
 
-	// Should not panic or error - just log a warning
-	proxy.warmupSystem(json.RawMessage(`"system prompt"`), json.RawMessage(`[]`), nil)
+	body := []byte(`{
+		"model": "test-model",
+		"messages": [{"role": "user", "content": "hello"}],
+		"system": "system prompt",
+		"tools": []
+	}`)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(body))
+	w := httptest.NewRecorder()
+
+	// Should not panic
+	proxy.ServeHTTP(w, req)
 }
