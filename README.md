@@ -8,6 +8,17 @@ The project uses a **disk-based KV-cache** for llama.cpp, implemented as an HTTP
 
 **Note:** this only works in single-threaded mode — only one conversation slot is managed at a time.
 
+### Usage
+
+```
+llama-rider -port <port> -system-cache-limit <n> /path/to/llama-server [llama-server args...]
+```
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `-port` | `"8080"` | Proxy listen port |
+| `-system-cache-limit` | `0` | Max system caches per model (`0` = unlimited) |
+
 ### What is cached
 
 Two types of cache files are stored in the `slot-save-path` directory:
@@ -39,9 +50,21 @@ Two types of cache files are stored in the `slot-save-path` directory:
 
 The model cache is saved one final time to prevent state loss.
 
+### Cache Cleanup
+
+By default, system cache files accumulate on disk. To limit their number, use the `-system-cache-limit` flag:
+
+```
+llama-rider -system-cache-limit 5 [llama-server args...]
+```
+
+This keeps at most `N` system caches per model. When a new cache is saved and the limit is exceeded, the oldest caches (by modification time) are automatically removed along with their `.ckpt` sidecar files.
+
+- **Default (`0`)**: unlimited — caches are never evicted.
+- Chat caches (`<model>--chat.bin`) are not affected by this limit.
+
 ### What is NOT implemented
 
-- **No LRU** — old files are never evicted, they accumulate on disk.
 - **No TTL** — files do not expire.
 - **No size-based policy** — decisions are based solely on file existence on disk.
 
