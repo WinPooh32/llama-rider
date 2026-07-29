@@ -37,9 +37,9 @@ I found these settings optimal for the 130k tokens context window:
 -ctv q8_0
 ```
 
-Read [llama-server readme](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md) for more details.
+Read the [llama-server README](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md) for more details.
 
-Disk usage of multiple models switched by llama-swap:
+Example disk usage for multiple models switched via llama-swap:
 
 ```sh
 $ du -h
@@ -102,7 +102,7 @@ The model cache is saved one final time to prevent state loss.
 By default, system cache files accumulate on disk. To limit their number, use the `-system-cache-limit` flag:
 
 ```
-llama-rider -system-cache-limit 5 [llama-server args...]
+llama-rider -system-cache-limit 5 /path/to/llama-server [llama-server args...]
 ```
 
 This keeps at most `N` system caches per model. When a new cache is saved and the limit is exceeded, the oldest caches (by modification time) are automatically removed along with their `.ckpt` sidecar files.
