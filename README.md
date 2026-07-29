@@ -35,8 +35,6 @@ The proxy extracts the following flags from llama-server arguments. They **must*
 | `--alias` | Model alias (used as prefix for cache filenames) |
 | `--slot-save-path` | Directory where `.bin` cache files are stored |
 
-Additionally, the proxy calls `/slots/0?action=save`, `?action=restore`, and `?action=erase` endpoints, so llama-server must be built with slot-save support.
-
 ### llama-server recommended settings
 
 I found these settings optimal for the 130k tokens context window:
