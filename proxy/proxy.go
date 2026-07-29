@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -74,25 +75,27 @@ type Message struct {
 // to manage KV-cache disk offload. It saves and restores model state
 // to/from the filesystem based on model switches and conversation context.
 type Proxy struct {
-	reverseProxy   *httputil.ReverseProxy
-	upstreamURL    string
-	baseModel      string
-	slotSavePath   string
-	dumpDirectory  string
-	client         *http.Client
-	mu             sync.Mutex
-	modelCacheName string
+	reverseProxy     *httputil.ReverseProxy
+	upstreamURL      string
+	baseModel        string
+	slotSavePath     string
+	dumpDirectory    string
+	systemCacheLimit int
+	client           *http.Client
+	mu               sync.Mutex
+	modelCacheName   string
 }
 
 // New creates a new Proxy that forwards requests to the given upstream URL
 // and manages KV-cache files in slotSavePath.
-func New(upstream *url.URL, model, slotSavePath, dumpDir string) *Proxy {
+func New(upstream *url.URL, model, slotSavePath, dumpDir string, systemCacheLimit int) *Proxy {
 	return &Proxy{
-		reverseProxy:  httputil.NewSingleHostReverseProxy(upstream),
-		upstreamURL:   upstream.String(),
-		baseModel:     model,
-		slotSavePath:  slotSavePath,
-		dumpDirectory: dumpDir,
+		reverseProxy:     httputil.NewSingleHostReverseProxy(upstream),
+		upstreamURL:      upstream.String(),
+		baseModel:        model,
+		slotSavePath:     slotSavePath,
+		dumpDirectory:    dumpDir,
+		systemCacheLimit: systemCacheLimit,
 		client: &http.Client{
 			Timeout: defaultClientTimeout,
 		},
@@ -225,6 +228,7 @@ func (p *Proxy) executeCacheAction(action cacheAction, req *requestBody) {
 		instructions := extractSystemInstructions(req.Messages)
 		p.warmupSystem(req.System, req.Tools, instructions)
 		p.saveCache(action.systemCache)
+		p.cleanupSystemCaches(req.Model, action.systemCache)
 	}
 
 	if action.restoreChat {
@@ -373,6 +377,75 @@ func (p *Proxy) saveCache(filename string) {
 	}
 }
 
+// cleanupSystemCaches removes old system cache files for a given model
+// when the number of caches exceeds the configured limit.
+// The newly saved cache (newCacheName) is always preserved.
+func (p *Proxy) cleanupSystemCaches(model, newCacheName string) {
+	if p.systemCacheLimit <= 1 {
+		return
+	}
+
+	limit := p.systemCacheLimit - 1
+
+	model = escapeFilenameInline(model)
+	newCacheName = escapeFilenameInline(newCacheName)
+
+	entries, err := os.ReadDir(p.slotSavePath)
+	if err != nil {
+		slog.Warn("read cache dir", "err", err)
+		return
+	}
+
+	type cacheFile struct {
+		name    string
+		modTime time.Time
+	}
+
+	var candidates []cacheFile
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		if e.Name() == newCacheName {
+			continue
+		}
+		if !strings.HasPrefix(e.Name(), model+systemCacheSeparator) || !strings.HasSuffix(e.Name(), ".bin") {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			slog.Warn("failed to get file info", "err", err)
+			continue
+		}
+		candidates = append(candidates, cacheFile{
+			name:    e.Name(),
+			modTime: info.ModTime(),
+		})
+	}
+
+	sort.Slice(candidates, func(i, j int) bool {
+		return candidates[i].modTime.Before(candidates[j].modTime)
+	})
+
+	for len(candidates) > limit {
+		old := candidates[0]
+		candidates = candidates[1:]
+		filePath := filepath.Join(p.slotSavePath, old.name)
+
+		if err := os.Remove(filePath); err != nil {
+			slog.Warn("failed to remove old cache", "file", old.name, "err", err)
+			continue
+		}
+
+		ckptPath := filePath + ".ckpt"
+		if err := os.Remove(ckptPath); err != nil {
+			slog.Warn("failed to remove old cache ckpt", "file", ckptPath, "err", err)
+		}
+
+		slog.Info("removed old system cache", "file", old.name)
+	}
+}
+
 // escapeFilenameInline replaces colons with double-dashes to avoid filesystem issues.
 // Inlined because it's a trivial single-use transformation.
 func escapeFilenameInline(name string) string {
@@ -434,4 +507,3 @@ func hashSystem(system json.RawMessage, tools json.RawMessage, instructions []Co
 	h.Write(tools)
 	return h.Sum32(), nil
 }
-

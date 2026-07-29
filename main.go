@@ -22,6 +22,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 
 	port := flag.String("port", "8080", "proxy listen port")
+	systemCacheLimit := flag.Int("system-cache-limit", 0, "max system caches per model (0 = unlimited)")
 	flag.Parse()
 
 	llamaArgs := flag.Args()
@@ -74,7 +75,7 @@ func main() {
 	slog.Info("proxy started", "upstream", upstream, "alias", llamaAlias, "slotSavePath", slotSavePath, "dumpDir", dumpDir)
 
 	mux := http.NewServeMux()
-	prx := proxy.New(upstream, llamaAlias, slotSavePath, dumpDir)
+	prx := proxy.New(upstream, llamaAlias, slotSavePath, dumpDir, *systemCacheLimit)
 	mux.Handle("/", prx)
 
 	addr := fmt.Sprintf(":%s", *port)

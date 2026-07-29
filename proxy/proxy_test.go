@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestNew_ForwardsRequests(t *testing.T) {
@@ -22,7 +23,7 @@ func TestNew_ForwardsRequests(t *testing.T) {
 	defer server.Close()
 
 	upstream, _ := url.Parse(server.URL)
-	proxy := New(upstream, "test-model", "/tmp/cache", "/tmp/dumps")
+	proxy := New(upstream, "test-model", "/tmp/cache", "/tmp/dumps", 0)
 
 	if proxy == nil {
 		t.Fatal("New returned nil")
@@ -44,7 +45,7 @@ func TestNew_ForwardsRequests(t *testing.T) {
 func TestDetermineCacheAction_NewSystem(t *testing.T) {
 	tmpDir := t.TempDir()
 	upstream, _ := url.Parse("http://127.0.0.1:8081")
-	proxy := New(upstream, "model1", tmpDir, "/tmp/dumps")
+	proxy := New(upstream, "model1", tmpDir, "/tmp/dumps", 0)
 
 	body := []byte(`{
 		"model": "model1",
@@ -74,7 +75,7 @@ func TestDetermineCacheAction_NewSystem(t *testing.T) {
 func TestDetermineCacheAction_SameModel(t *testing.T) {
 	tmpDir := t.TempDir()
 	upstream, _ := url.Parse("http://127.0.0.1:8081")
-	proxy := New(upstream, "model1", tmpDir, "/tmp/dumps")
+	proxy := New(upstream, "model1", tmpDir, "/tmp/dumps", 0)
 
 	body := []byte(`{
 		"model": "model1",
@@ -112,7 +113,7 @@ func TestDetermineCacheAction_SameModel(t *testing.T) {
 func TestDetermineCacheAction_ModelSwitch_Continuation(t *testing.T) {
 	tmpDir := t.TempDir()
 	upstream, _ := url.Parse("http://127.0.0.1:8081")
-	proxy := New(upstream, "model1", tmpDir, "/tmp/dumps")
+	proxy := New(upstream, "model1", tmpDir, "/tmp/dumps", 0)
 
 	hash, _ := hashSystem(json.RawMessage(`"system prompt"`), json.RawMessage(`[]`), nil)
 	systemCache := fmt.Sprintf("model1%s%x.bin", systemCacheSeparator, hash)
@@ -149,7 +150,7 @@ func TestServeHTTP_ForwardsNonMessagesPath(t *testing.T) {
 	defer server.Close()
 
 	upstream, _ := url.Parse(server.URL)
-	proxy := New(upstream, "model1", "/tmp/cache", "/tmp/dumps")
+	proxy := New(upstream, "model1", "/tmp/cache", "/tmp/dumps", 0)
 
 	req := httptest.NewRequest(http.MethodGet, "/v1/completions", nil)
 	w := httptest.NewRecorder()
@@ -182,7 +183,7 @@ func TestServeHTTP_WithMessagesPath(t *testing.T) {
 
 	upstream, _ := url.Parse(server.URL)
 	tmpDir := t.TempDir()
-	proxy := New(upstream, "model1", tmpDir, "/tmp/dumps")
+	proxy := New(upstream, "model1", tmpDir, "/tmp/dumps", 0)
 
 	body := []byte(`{
 		"model": "model1",
@@ -221,7 +222,7 @@ func TestServeHTTP_WithModelSwitch(t *testing.T) {
 
 	upstream, _ := url.Parse(server.URL)
 	tmpDir := t.TempDir()
-	proxy := New(upstream, "model1", tmpDir, "/tmp/dumps")
+	proxy := New(upstream, "model1", tmpDir, "/tmp/dumps", 0)
 
 	// First request to establish model1 cache
 	firstBody := []byte(`{
@@ -272,7 +273,7 @@ func TestServeHTTP_TriggersRestoreOnModelSwitch(t *testing.T) {
 
 	upstream, _ := url.Parse(server.URL)
 	tmpDir := t.TempDir()
-	proxy := New(upstream, "model1", tmpDir, "/tmp/dumps")
+	proxy := New(upstream, "model1", tmpDir, "/tmp/dumps", 0)
 
 	// Pre-create system cache for model2 so switch triggers restoreChat instead of erase+warmup
 	hash, _ := hashSystem(json.RawMessage(`"system prompt"`), json.RawMessage(`[]`), nil)
@@ -329,7 +330,7 @@ func TestServeHTTP_TriggersRestoreWithEscapedFilename(t *testing.T) {
 
 	upstream, _ := url.Parse(server.URL)
 	tmpDir := t.TempDir()
-	proxy := New(upstream, "model:name", tmpDir, "/tmp/dumps")
+	proxy := New(upstream, "model:name", tmpDir, "/tmp/dumps", 0)
 
 	// First request to establish cache with colons in model name
 	firstBody := []byte(`{
@@ -379,7 +380,7 @@ func TestServeHTTP_TriggersEraseOnNewSystem(t *testing.T) {
 
 	upstream, _ := url.Parse(server.URL)
 	tmpDir := t.TempDir()
-	proxy := New(upstream, "model1", tmpDir, "/tmp/dumps")
+	proxy := New(upstream, "model1", tmpDir, "/tmp/dumps", 0)
 
 	body := []byte(`{
 		"model": "model1",
@@ -417,7 +418,7 @@ func TestServeHTTP_TriggersSaveOnModelSwitch(t *testing.T) {
 
 	upstream, _ := url.Parse(server.URL)
 	tmpDir := t.TempDir()
-	proxy := New(upstream, "model1", tmpDir, "/tmp/dumps")
+	proxy := New(upstream, "model1", tmpDir, "/tmp/dumps", 0)
 
 	// Pre-create system cache for model2 so switch doesn't trigger erase/warmup
 	hash, _ := hashSystem(json.RawMessage(`"system prompt"`), json.RawMessage(`[]`), nil)
@@ -458,7 +459,7 @@ func TestServeHTTP_TriggersSaveOnModelSwitch(t *testing.T) {
 func TestDetermineCacheAction_NoSaveOnSameModel(t *testing.T) {
 	tmpDir := t.TempDir()
 	upstream, _ := url.Parse("http://127.0.0.1:8081")
-	proxy := New(upstream, "model1", tmpDir, "/tmp/dumps")
+	proxy := New(upstream, "model1", tmpDir, "/tmp/dumps", 0)
 
 	hash, _ := hashSystem(json.RawMessage(`"system prompt"`), json.RawMessage(`[]`), nil)
 	systemCache := fmt.Sprintf("model1%s%x.bin", systemCacheSeparator, hash)
@@ -496,7 +497,7 @@ func TestDetermineCacheAction_NoSaveOnSameModel(t *testing.T) {
 func TestDetermineCacheAction_SaveOnModelSwitch(t *testing.T) {
 	tmpDir := t.TempDir()
 	upstream, _ := url.Parse("http://127.0.0.1:8081")
-	proxy := New(upstream, "model1", tmpDir, "/tmp/dumps")
+	proxy := New(upstream, "model1", tmpDir, "/tmp/dumps", 0)
 
 	hash, _ := hashSystem(json.RawMessage(`"system prompt"`), json.RawMessage(`[]`), nil)
 	systemCache := fmt.Sprintf("model1%s%x.bin", systemCacheSeparator, hash)
@@ -529,7 +530,7 @@ func TestDetermineCacheAction_SaveOnModelSwitch(t *testing.T) {
 func TestDetermineCacheAction_SaveOnNewSystem(t *testing.T) {
 	tmpDir := t.TempDir()
 	upstream, _ := url.Parse("http://127.0.0.1:8081")
-	proxy := New(upstream, "model1", tmpDir, "/tmp/dumps")
+	proxy := New(upstream, "model1", tmpDir, "/tmp/dumps", 0)
 
 	proxy.modelCacheName = "model1--chat.bin"
 
@@ -556,7 +557,7 @@ func TestDetermineCacheAction_SaveOnNewSystem(t *testing.T) {
 func TestDetermineCacheAction_ModelSwitch_EmptyConversation(t *testing.T) {
 	tmpDir := t.TempDir()
 	upstream, _ := url.Parse("http://127.0.0.1:8081")
-	proxy := New(upstream, "model1", tmpDir, "/tmp/dumps")
+	proxy := New(upstream, "model1", tmpDir, "/tmp/dumps", 0)
 
 	hash, _ := hashSystem(json.RawMessage(`"system prompt"`), json.RawMessage(`[]`), nil)
 	systemCache := fmt.Sprintf("model1%s%x.bin", systemCacheSeparator, hash)
@@ -603,7 +604,7 @@ func TestServeHTTP_WithEmptyBaseModel(t *testing.T) {
 	defer server.Close()
 
 	upstream, _ := url.Parse(server.URL)
-	proxy := New(upstream, "", "/tmp/cache", "/tmp/dumps")
+	proxy := New(upstream, "", "/tmp/cache", "/tmp/dumps", 0)
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
 	w := httptest.NewRecorder()
@@ -624,7 +625,7 @@ func TestSaveChatCache_Concurrent(t *testing.T) {
 
 	upstream, _ := url.Parse(server.URL)
 	tmpDir := t.TempDir()
-	proxy := New(upstream, "model1", tmpDir, "/tmp/dumps")
+	proxy := New(upstream, "model1", tmpDir, "/tmp/dumps", 0)
 
 	// Establish cache through ServeHTTP first
 	firstBody := []byte(`{
@@ -668,7 +669,7 @@ func TestSaveChatCache_SavesCache(t *testing.T) {
 
 	upstream, _ := url.Parse(server.URL)
 	tmpDir := t.TempDir()
-	proxy := New(upstream, "model1", tmpDir, "/tmp/dumps")
+	proxy := New(upstream, "model1", tmpDir, "/tmp/dumps", 0)
 
 	// Establish cache through ServeHTTP
 	firstBody := []byte(`{
@@ -703,7 +704,7 @@ func TestServeHTTP_TriggersWarmupWithEmptyContents(t *testing.T) {
 
 	upstream, _ := url.Parse(server.URL)
 	tmpDir := t.TempDir()
-	proxy := New(upstream, "test-model", tmpDir, "/tmp/dumps")
+	proxy := New(upstream, "test-model", tmpDir, "/tmp/dumps", 0)
 
 	// Send request that triggers warmup (no system cache exists)
 	body := []byte(`{
@@ -744,7 +745,7 @@ func TestServeHTTP_TriggersWarmupWithContents(t *testing.T) {
 
 	upstream, _ := url.Parse(server.URL)
 	tmpDir := t.TempDir()
-	proxy := New(upstream, "test-model", tmpDir, "/tmp/dumps")
+	proxy := New(upstream, "test-model", tmpDir, "/tmp/dumps", 0)
 
 	// Send request with multiple content blocks (instructions = all but last)
 	body := []byte(`{
@@ -802,7 +803,7 @@ func TestServeHTTP_TriggersWarmupWithTools(t *testing.T) {
 
 	upstream, _ := url.Parse(server.URL)
 	tmpDir := t.TempDir()
-	proxy := New(upstream, "test-model", tmpDir, "/tmp/dumps")
+	proxy := New(upstream, "test-model", tmpDir, "/tmp/dumps", 0)
 
 	tools := json.RawMessage(`[{"name":"test_tool"}]`)
 	body := fmt.Sprintf(`{
@@ -837,7 +838,7 @@ func TestServeHTTP_WarmupHTTPErrorDoesNotPanic(t *testing.T) {
 
 	upstream, _ := url.Parse(server.URL)
 	tmpDir := t.TempDir()
-	proxy := New(upstream, "test-model", tmpDir, "/tmp/dumps")
+	proxy := New(upstream, "test-model", tmpDir, "/tmp/dumps", 0)
 
 	body := []byte(`{
 		"model": "test-model",
@@ -851,4 +852,254 @@ func TestServeHTTP_WarmupHTTPErrorDoesNotPanic(t *testing.T) {
 
 	// Should not panic
 	proxy.ServeHTTP(w, req)
+}
+
+func TestCleanupSystemCaches_LimitZero_NoOp(t *testing.T) {
+	tmpDir := t.TempDir()
+	upstream, _ := url.Parse("http://127.0.0.1:8081")
+	proxy := New(upstream, "model1", tmpDir, "/tmp/dumps", 0)
+
+	// Create 5 system cache files
+	for i := 0; i < 5; i++ {
+		name := fmt.Sprintf("model1--system--%02d.bin", i)
+		_ = os.WriteFile(filepath.Join(tmpDir, name), []byte("test"), 0644)
+	}
+
+	proxy.cleanupSystemCaches("model1", "model1--system--99.bin")
+
+	entries, _ := os.ReadDir(tmpDir)
+	if len(entries) != 5 {
+		t.Errorf("expected 5 files, got %d", len(entries))
+	}
+}
+
+func TestCleanupSystemCaches_UnderLimit(t *testing.T) {
+	tmpDir := t.TempDir()
+	upstream, _ := url.Parse("http://127.0.0.1:8081")
+	proxy := New(upstream, "model1", tmpDir, "/tmp/dumps", 5)
+
+	// Create 2 system cache files
+	for i := 0; i < 2; i++ {
+		name := fmt.Sprintf("model1--system--%02d.bin", i)
+		_ = os.WriteFile(filepath.Join(tmpDir, name), []byte("test"), 0644)
+	}
+
+	proxy.cleanupSystemCaches("model1", "model1--system--99.bin")
+
+	entries, _ := os.ReadDir(tmpDir)
+	if len(entries) != 2 {
+		t.Errorf("expected 2 files, got %d", len(entries))
+	}
+}
+
+func TestCleanupSystemCaches_AtLimit(t *testing.T) {
+	tmpDir := t.TempDir()
+	upstream, _ := url.Parse("http://127.0.0.1:8081")
+	proxy := New(upstream, "model1", tmpDir, "/tmp/dumps", 3)
+
+	// Create exactly 3 system cache files
+	for i := 0; i < 3; i++ {
+		name := fmt.Sprintf("model1--system--%02d.bin", i)
+		_ = os.WriteFile(filepath.Join(tmpDir, name), []byte("test"), 0644)
+	}
+
+	proxy.cleanupSystemCaches("model1", "model1--system--99.bin")
+
+	entries, _ := os.ReadDir(tmpDir)
+	if len(entries) != 2 {
+		t.Errorf("expected 2 files, got %d", len(entries))
+	}
+}
+
+func TestCleanupSystemCaches_OverLimit(t *testing.T) {
+	tmpDir := t.TempDir()
+	upstream, _ := url.Parse("http://127.0.0.1:8081")
+	proxy := New(upstream, "model1", tmpDir, "/tmp/dumps", 2)
+
+	// Create 5 system cache files with different mod times
+	for i := 0; i < 5; i++ {
+		name := fmt.Sprintf("model1--system--%02d.bin", i)
+		path := filepath.Join(tmpDir, name)
+		_ = os.WriteFile(path, []byte("test"), 0644)
+		// Set mod time: higher index = newer
+		tm := time.Date(2024, 1, 1, 0, 0, i, 0, time.UTC)
+		_ = os.Chtimes(path, tm, tm)
+	}
+
+	proxy.cleanupSystemCaches("model1", "model1--system--99.bin")
+
+	entries, _ := os.ReadDir(tmpDir)
+	if len(entries) != 1 {
+		t.Errorf("expected 1 file, got %d", len(entries))
+	}
+
+	// Check that the newest 1 remains
+	for _, e := range entries {
+		name := e.Name()
+		if strings.HasSuffix(name, "04.bin") {
+			continue
+		}
+		t.Errorf("unexpected file remaining: %s", name)
+	}
+}
+
+func TestCleanupSystemCaches_ExcludesNewCache(t *testing.T) {
+	tmpDir := t.TempDir()
+	upstream, _ := url.Parse("http://127.0.0.1:8081")
+	proxy := New(upstream, "model1", tmpDir, "/tmp/dumps", 2)
+
+	// Create 4 system cache files with different mod times
+	for i := 0; i < 4; i++ {
+		name := fmt.Sprintf("model1--system--%02d.bin", i)
+		path := filepath.Join(tmpDir, name)
+		_ = os.WriteFile(path, []byte("test"), 0644)
+		tm := time.Date(2024, 1, 1, 0, 0, i, 0, time.UTC)
+		_ = os.Chtimes(path, tm, tm)
+	}
+
+	// "new" cache is the newest (index 3), should be preserved
+	newCache := "model1--system--03.bin"
+	proxy.cleanupSystemCaches("model1", newCache)
+
+	entries, _ := os.ReadDir(tmpDir)
+	found := false
+	for _, e := range entries {
+		if e.Name() == newCache {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("new cache %s was not preserved", newCache)
+	}
+
+	if len(entries) != 2 {
+		t.Errorf("expected 2 files (new + 1 within limit), got %d", len(entries))
+	}
+}
+
+func TestCleanupSystemCaches_EmptyDir(t *testing.T) {
+	tmpDir := t.TempDir()
+	upstream, _ := url.Parse("http://127.0.0.1:8081")
+	proxy := New(upstream, "model1", tmpDir, "/tmp/dumps", 5)
+
+	// Should not panic or error
+	proxy.cleanupSystemCaches("model1", "model1--system--99.bin")
+
+	entries, _ := os.ReadDir(tmpDir)
+	if len(entries) != 0 {
+		t.Errorf("expected 0 files, got %d", len(entries))
+	}
+}
+
+func TestCleanupSystemCaches_RemovesCkptSidecar(t *testing.T) {
+	tmpDir := t.TempDir()
+	upstream, _ := url.Parse("http://127.0.0.1:8081")
+	proxy := New(upstream, "model1", tmpDir, "/tmp/dumps", 2)
+
+	// Create 3 system cache files, each with a matching .ckpt
+	for i := 0; i < 3; i++ {
+		binName := fmt.Sprintf("model1--system--%02d.bin", i)
+		binPath := filepath.Join(tmpDir, binName)
+		ckptPath := filepath.Join(tmpDir, binName+".ckpt")
+		_ = os.WriteFile(binPath, []byte("bin"), 0644)
+		_ = os.WriteFile(ckptPath, []byte("ckpt"), 0644)
+		tm := time.Date(2024, 1, 1, 0, 0, i, 0, time.UTC)
+		_ = os.Chtimes(binPath, tm, tm)
+		_ = os.Chtimes(ckptPath, tm, tm)
+	}
+
+	proxy.cleanupSystemCaches("model1", "model1--system--99.bin")
+
+	entries, _ := os.ReadDir(tmpDir)
+	names := make(map[string]bool)
+	for _, e := range entries {
+		names[e.Name()] = true
+	}
+
+	// Newest .bin and .ckpt should remain
+	if !names["model1--system--02.bin"] {
+		t.Error("newest .bin was removed")
+	}
+	if !names["model1--system--02.bin.ckpt"] {
+		t.Error("newest .bin.ckpt was removed")
+	}
+
+	// Older pairs should be deleted
+	if names["model1--system--00.bin"] {
+		t.Error("oldest .bin was not removed")
+	}
+	if names["model1--system--00.bin.ckpt"] {
+		t.Error("oldest .bin.ckpt was not removed")
+	}
+	if names["model1--system--01.bin"] {
+		t.Error("middle .bin was not removed")
+	}
+	if names["model1--system--01.bin.ckpt"] {
+		t.Error("middle .bin.ckpt was not removed")
+	}
+
+	// Exactly 2 files remain: 1 .bin + 1 .ckpt
+	if len(entries) != 2 {
+		t.Errorf("expected 2 files, got %d", len(entries))
+	}
+}
+
+func TestCleanupSystemCaches_MixedFiles(t *testing.T) {
+	tmpDir := t.TempDir()
+	upstream, _ := url.Parse("http://127.0.0.1:8081")
+	proxy := New(upstream, "model1", tmpDir, "/tmp/dumps", 2)
+
+	// Create 3 system cache files
+	for i := 0; i < 3; i++ {
+		name := fmt.Sprintf("model1--system--%02d.bin", i)
+		path := filepath.Join(tmpDir, name)
+		_ = os.WriteFile(path, []byte("test"), 0644)
+		tm := time.Date(2024, 1, 1, 0, 0, i, 0, time.UTC)
+		_ = os.Chtimes(path, tm, tm)
+	}
+
+	// Create chat cache and other files
+	_ = os.WriteFile(filepath.Join(tmpDir, "model1--chat.bin"), []byte("chat"), 0644)
+	_ = os.WriteFile(filepath.Join(tmpDir, "other--system--00.bin"), []byte("other"), 0644)
+	_ = os.WriteFile(filepath.Join(tmpDir, "random.txt"), []byte("random"), 0644)
+
+	newCache := "model1--system--02.bin"
+	proxy.cleanupSystemCaches("model1", newCache)
+
+	entries, _ := os.ReadDir(tmpDir)
+	names := make(map[string]bool)
+	for _, e := range entries {
+		names[e.Name()] = true
+	}
+
+	// Chat cache should remain
+	if !names["model1--chat.bin"] {
+		t.Error("chat cache was incorrectly removed")
+	}
+
+	// Other model's system cache should remain
+	if !names["other--system--00.bin"] {
+		t.Error("other model's system cache was incorrectly removed")
+	}
+
+	// Random file should remain
+	if !names["random.txt"] {
+		t.Error("random file was incorrectly removed")
+	}
+
+	// New cache should remain
+	if !names[newCache] {
+		t.Error("new cache was incorrectly removed")
+	}
+
+	// Within limit (1) + new = 2 system files for model1
+	systemCount := 0
+	for name := range names {
+		if strings.HasPrefix(name, "model1--system--") {
+			systemCount++
+		}
+	}
+	if systemCount != 2 {
+		t.Errorf("expected 2 model1 system files (new + limit), got %d", systemCount)
+	}
 }
