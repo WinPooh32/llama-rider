@@ -2,6 +2,12 @@
 
 Proof of concept project for controlling llama.cpp KV-cache disk offload using http API endpoints.
 
+## Installation
+
+```sh
+go install github.com/WinPooh32/llama-rider@latest
+```
+
 ## Cache Management
 
 The project uses a **disk-based KV-cache** for llama.cpp, implemented as an HTTP proxy in front of `llama-server`. The cache persists the model's KV-slot state to disk so conversations can be resumed without re-running the full prompt through the model (cache prefill).
@@ -10,7 +16,7 @@ The project uses a **disk-based KV-cache** for llama.cpp, implemented as an HTTP
 
 ### Usage
 
-```
+```sh
 llama-rider -port <port> -system-cache-limit <n> /path/to/llama-server [llama-server args...]
 ```
 
@@ -18,6 +24,47 @@ llama-rider -port <port> -system-cache-limit <n> /path/to/llama-server [llama-se
 | --- | --- | --- |
 | `-port` | `"8080"` | Proxy listen port |
 | `-system-cache-limit` | `0` | Max system caches per model (`0` = unlimited) |
+
+### llama-server recommended settings
+
+I found these settings optimal for the 130k tokens context window:
+
+```sh
+--cache-ram 4096
+--ctx-checkpoints 32
+--checkpoint-min-step 4096
+-ctk q8_0
+-ctv q8_0
+```
+
+Read [llama-server readme](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md) for more details.
+
+Disk usage of multiple models switched by llama-swap:
+
+```sh
+$ du -h
+6,1G	.
+```
+
+```sh
+$ du -sh *
+1,2G	qwen3.6-27b--chat.bin
+1,1G	qwen3.6-27b--chat.bin.ckpt
+161M	qwen3.6-27b--system--62f45e3f.bin
+300M	qwen3.6-27b--system--62f45e3f.bin.ckpt
+567M	qwen3.6-27b--system--a1f7fca1.bin
+449M	qwen3.6-27b--system--a1f7fca1.bin.ckpt
+565M	qwen3.6-27b--system--f1272f16.bin
+449M	qwen3.6-27b--system--f1272f16.bin.ckpt
+264M	qwen3.6-35b-a3b--agent--chat.bin
+315M	qwen3.6-35b-a3b--agent--chat.bin.ckpt
+141M	qwen3.6-35b-a3b--agent--system--8a2de77a.bin
+126M	qwen3.6-35b-a3b--agent--system--8a2de77a.bin.ckpt
+138M	qwen3.6-35b-a3b--agent--system--bdffaecb.bin
+126M	qwen3.6-35b-a3b--agent--system--bdffaecb.bin.ckpt
+197M	qwen3.6-35b-a3b--agent--system--f94279e4.bin
+189M	qwen3.6-35b-a3b--agent--system--f94279e4.bin.ckpt
+```
 
 ### What is cached
 
