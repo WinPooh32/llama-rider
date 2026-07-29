@@ -25,6 +25,18 @@ llama-rider -port <port> -system-cache-limit <n> /path/to/llama-server [llama-se
 | `-port` | `"8080"` | Proxy listen port |
 | `-system-cache-limit` | `0` | Max system caches per model (`0` = unlimited) |
 
+### llama-server required flags
+
+The proxy extracts the following flags from llama-server arguments. They **must** be present:
+
+| Flag | Description |
+| --- | --- |
+| `--port` | Port llama-server listens on (proxy forwards to it) |
+| `--alias` | Model alias (used as prefix for cache filenames) |
+| `--slot-save-path` | Directory where `.bin` cache files are stored |
+
+Additionally, the proxy calls `/slots/0?action=save`, `?action=restore`, and `?action=erase` endpoints, so llama-server must be built with slot-save support.
+
 ### llama-server recommended settings
 
 I found these settings optimal for the 130k tokens context window:
