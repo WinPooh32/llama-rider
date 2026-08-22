@@ -479,7 +479,7 @@ func extractOpenAISystem(messages []Message) (json.RawMessage, []Message) {
 	var system []Content
 	var chat []Message
 	for _, m := range messages {
-		if m.Role == "system" {
+		if m.Role == "system" || m.Role == "developer" {
 			system = append(system, m.Content...)
 			continue
 		}
