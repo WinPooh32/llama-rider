@@ -952,6 +952,24 @@ func TestCleanupSystemCaches_LimitZero_NoOp(t *testing.T) {
 	}
 }
 
+func TestCleanupSystemCaches_LimitOne_KeepsOnlyNewest(t *testing.T) {
+	tmpDir := t.TempDir()
+	upstream, _ := url.Parse("http://127.0.0.1:8081")
+	proxy := New(upstream, "model1", tmpDir, "/tmp/dumps", 1)
+
+	for i := 0; i < 3; i++ {
+		name := fmt.Sprintf("model1--system--%02d.bin", i)
+		_ = os.WriteFile(filepath.Join(tmpDir, name), []byte("test"), 0644)
+	}
+
+	proxy.cleanupSystemCaches("model1", "model1--system--99.bin")
+
+	entries, _ := os.ReadDir(tmpDir)
+	if len(entries) != 0 {
+		t.Errorf("expected 0 old files, got %d", len(entries))
+	}
+}
+
 func TestCleanupSystemCaches_UnderLimit(t *testing.T) {
 	tmpDir := t.TempDir()
 	upstream, _ := url.Parse("http://127.0.0.1:8081")
@@ -1180,5 +1198,43 @@ func TestCleanupSystemCaches_MixedFiles(t *testing.T) {
 	}
 	if systemCount != 2 {
 		t.Errorf("expected 2 model1 system files (new + limit), got %d", systemCount)
+	}
+}
+
+func TestServeHTTP_MalformedRequestPreservesModelCacheName(t *testing.T) {
+	var mu sync.Mutex
+	var saves []string
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/slots/0" && r.URL.RawQuery == "action=save" {
+			var b struct {
+				Filename string `json:"filename"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&b)
+			mu.Lock()
+			saves = append(saves, b.Filename)
+			mu.Unlock()
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	}))
+	defer server.Close()
+
+	upstream, _ := url.Parse(server.URL)
+	tmpDir := t.TempDir()
+	proxy := New(upstream, "model1", tmpDir, "/tmp/dumps", 0)
+
+	valid := []byte(`{"model": "model1", "messages": [{"role": "user", "content": "hello"}], "system": "s", "tools": []}`)
+	proxy.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(valid)))
+
+	// Malformed request must not clobber modelCacheName
+	proxy.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader([]byte("not json"))))
+
+	proxy.SaveChatCache()
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(saves) == 0 || saves[len(saves)-1] != "model1--chat.bin" {
+		t.Errorf("expected final save of model1--chat.bin, got %v", saves)
 	}
 }

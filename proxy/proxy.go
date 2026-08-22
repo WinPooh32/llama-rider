@@ -139,7 +139,9 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	r.Body = io.NopCloser(bytes.NewReader(body))
 	p.reverseProxy.ServeHTTP(w, r)
 
-	p.modelCacheName = action.modelCache
+	if action.modelCache != "" {
+		p.modelCacheName = action.modelCache
+	}
 }
 
 // SaveChatCache saves the current model's chat cache.
@@ -233,7 +235,7 @@ func (p *Proxy) executeCacheAction(action cacheAction, req *requestBody) {
 	}
 
 	if action.warmup && req != nil {
-		p.warmupSystem(req.System, req.Tools, action.instructions)
+		p.warmupSystem(req.Model, req.System, req.Tools, action.instructions)
 		p.saveCache(action.systemCache)
 		p.cleanupSystemCaches(req.Model, action.systemCache)
 	}
@@ -255,8 +257,8 @@ func (p *Proxy) saveCurrentModelCache() {
 	p.saveCache(p.modelCacheName)
 }
 
-func (p *Proxy) warmupSystem(system json.RawMessage, tools json.RawMessage, contents []Content) {
-	slog.Info("warmup system", "model", p.baseModel)
+func (p *Proxy) warmupSystem(model string, system json.RawMessage, tools json.RawMessage, contents []Content) {
+	slog.Info("warmup system", "model", model)
 
 	var messages []Message
 	if len(contents) == 0 {
@@ -269,7 +271,7 @@ func (p *Proxy) warmupSystem(system json.RawMessage, tools json.RawMessage, cont
 	}
 
 	payload := map[string]any{
-		"model":      p.baseModel,
+		"model":      model,
 		"max_tokens": 0,
 		"system":     system,
 		"stream":     false,
@@ -388,7 +390,7 @@ func (p *Proxy) saveCache(filename string) {
 // when the number of caches exceeds the configured limit.
 // The newly saved cache (newCacheName) is always preserved.
 func (p *Proxy) cleanupSystemCaches(model, newCacheName string) {
-	if p.systemCacheLimit <= 1 {
+	if p.systemCacheLimit <= 0 {
 		return
 	}
 
