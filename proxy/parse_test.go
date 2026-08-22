@@ -44,6 +44,57 @@ func TestContents_UnmarshalJSON_Array(t *testing.T) {
 	}
 }
 
+func TestExtractOpenAISystem_NoSystem(t *testing.T) {
+	messages := []Message{
+		{Role: "user", Content: Contents{{Type: "text", Text: "hi"}}},
+		{Role: "assistant", Content: Contents{{Type: "text", Text: "hello"}}},
+	}
+	system, chat := extractOpenAISystem(messages)
+	if system != nil {
+		t.Errorf("expected nil system, got %s", system)
+	}
+	if len(chat) != 2 {
+		t.Errorf("expected 2 chat messages, got %d", len(chat))
+	}
+}
+
+func TestExtractOpenAISystem_StringContent(t *testing.T) {
+	messages := []Message{
+		{Role: "system", Content: Contents{{Type: "text", Text: "be brief"}}},
+		{Role: "user", Content: Contents{{Type: "text", Text: "hi"}}},
+	}
+	system, chat := extractOpenAISystem(messages)
+	if len(chat) != 1 || chat[0].Role != "user" {
+		t.Fatalf("unexpected chat: %+v", chat)
+	}
+	var blocks []Content
+	if err := json.Unmarshal(system, &blocks); err != nil {
+		t.Fatalf("system is not a JSON array of blocks: %v", err)
+	}
+	if len(blocks) != 1 || blocks[0].Text != "be brief" {
+		t.Errorf("unexpected system: %+v", blocks)
+	}
+}
+
+func TestExtractOpenAISystem_MultipleSystemMessages(t *testing.T) {
+	messages := []Message{
+		{Role: "system", Content: Contents{{Type: "text", Text: "one"}}},
+		{Role: "user", Content: Contents{{Type: "text", Text: "hi"}}},
+		{Role: "system", Content: Contents{{Type: "text", Text: "two"}}},
+	}
+	system, chat := extractOpenAISystem(messages)
+	if len(chat) != 1 || chat[0].Role != "user" {
+		t.Fatalf("unexpected chat: %+v", chat)
+	}
+	var blocks []Content
+	if err := json.Unmarshal(system, &blocks); err != nil {
+		t.Fatalf("system is not a JSON array of blocks: %v", err)
+	}
+	if len(blocks) != 2 || blocks[0].Text != "one" || blocks[1].Text != "two" {
+		t.Errorf("unexpected system: %+v", blocks)
+	}
+}
+
 func TestIsUserOnlyConversation_AllUser(t *testing.T) {
 	messages := []Message{
 		{Role: "user", Content: Contents{{Type: "text", Text: "hi"}}},

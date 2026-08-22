@@ -54,7 +54,7 @@ func TestDetermineCacheAction_NewSystem(t *testing.T) {
 		"tools": []
 	}`)
 
-	action, req := proxy.determineCacheAction(body)
+	action, req := proxy.determineCacheAction(messagesPath, body)
 	if req == nil {
 		t.Fatal("expected parsed request")
 	}
@@ -95,7 +95,7 @@ func TestDetermineCacheAction_SameModel(t *testing.T) {
 
 	proxy.modelCacheName = "model1--chat.bin"
 
-	action, _ := proxy.determineCacheAction(body)
+	action, _ := proxy.determineCacheAction(messagesPath, body)
 	if action.erase {
 		t.Error("unexpected erase action")
 	}
@@ -133,7 +133,7 @@ func TestDetermineCacheAction_ModelSwitch_Continuation(t *testing.T) {
 		"tools": []
 	}`)
 
-	action, _ := proxy.determineCacheAction(body)
+	action, _ := proxy.determineCacheAction(messagesPath, body)
 	if !action.restoreChat {
 		t.Error("expected restoreChat to be true for model switch with conversation")
 	}
@@ -202,6 +202,85 @@ func TestServeHTTP_WithMessagesPath(t *testing.T) {
 	}
 	if w.Body.String() != `{"response": "hello"}` {
 		t.Errorf("unexpected body: %q", w.Body.String())
+	}
+}
+
+func TestServeHTTP_WithChatCompletionsPath(t *testing.T) {
+	var eraseReceived bool
+	var mu sync.Mutex
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		if r.URL.Path == "/slots/0" && r.URL.RawQuery == "action=erase" {
+			eraseReceived = true
+		}
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"response": "hello"}`))
+	}))
+	defer server.Close()
+
+	upstream, _ := url.Parse(server.URL)
+	tmpDir := t.TempDir()
+	proxy := New(upstream, "model1", tmpDir, "/tmp/dumps", 0)
+
+	body := []byte(`{
+		"model": "model1",
+		"messages": [
+			{"role": "system", "content": "system prompt"},
+			{"role": "user", "content": "hello"}
+		],
+		"tools": []
+	}`)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(body))
+	w := httptest.NewRecorder()
+
+	proxy.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected status 200, got %d", w.Code)
+	}
+	if w.Body.String() != `{"response": "hello"}` {
+		t.Errorf("unexpected body: %q", w.Body.String())
+	}
+	if !eraseReceived {
+		t.Error("expected erase to be called for new system prompt")
+	}
+}
+
+func TestDetermineCacheAction_ChatCompletions_ModelSwitch(t *testing.T) {
+	tmpDir := t.TempDir()
+	upstream, _ := url.Parse("http://127.0.0.1:8081")
+	proxy := New(upstream, "model1", tmpDir, "/tmp/dumps", 0)
+
+	hash, _ := hashSystem(json.RawMessage(`[{"type":"text","text":"system prompt"}]`), json.RawMessage(`[]`), nil)
+	systemCache := fmt.Sprintf("model1%s%x.bin", systemCacheSeparator, hash)
+	cacheFile := filepath.Join(tmpDir, systemCache)
+	_ = os.WriteFile(cacheFile, []byte("test"), 0644)
+
+	systemCache2 := fmt.Sprintf("model2%s%x.bin", systemCacheSeparator, hash)
+	cacheFile2 := filepath.Join(tmpDir, systemCache2)
+	_ = os.WriteFile(cacheFile2, []byte("test"), 0644)
+
+	proxy.modelCacheName = "model1--chat.bin"
+
+	body := []byte(`{
+		"model": "model2",
+		"messages": [
+			{"role": "system", "content": "system prompt"},
+			{"role": "user", "content": "hello"},
+			{"role": "assistant", "content": "hi"}
+		],
+		"tools": []
+	}`)
+
+	action, _ := proxy.determineCacheAction(chatCompletionsPath, body)
+	if !action.restoreChat {
+		t.Error("expected restoreChat to be true for model switch with conversation")
+	}
+	if !action.saveCurrent {
+		t.Error("expected saveCurrent to be true for model switch")
 	}
 }
 
@@ -475,7 +554,7 @@ func TestDetermineCacheAction_NoSaveOnSameModel(t *testing.T) {
 		"tools": []
 	}`)
 
-	action, _ := proxy.determineCacheAction(body)
+	action, _ := proxy.determineCacheAction(messagesPath, body)
 
 	if action.saveCurrent {
 		t.Error("expected saveCurrent to be false for same model/system")
@@ -517,7 +596,7 @@ func TestDetermineCacheAction_SaveOnModelSwitch(t *testing.T) {
 		"tools": []
 	}`)
 
-	action, _ := proxy.determineCacheAction(body)
+	action, _ := proxy.determineCacheAction(messagesPath, body)
 
 	if !action.saveCurrent {
 		t.Error("expected saveCurrent to be true for model switch")
@@ -541,7 +620,7 @@ func TestDetermineCacheAction_SaveOnNewSystem(t *testing.T) {
 		"tools": []
 	}`)
 
-	action, _ := proxy.determineCacheAction(body)
+	action, _ := proxy.determineCacheAction(messagesPath, body)
 
 	if !action.saveCurrent {
 		t.Error("expected saveCurrent to be true for new system prompt")
@@ -577,7 +656,7 @@ func TestDetermineCacheAction_ModelSwitch_EmptyConversation(t *testing.T) {
 		"tools": []
 	}`)
 
-	action, _ := proxy.determineCacheAction(body)
+	action, _ := proxy.determineCacheAction(messagesPath, body)
 
 	if !action.saveCurrent {
 		t.Error("expected saveCurrent to be true for model switch")

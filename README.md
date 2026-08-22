@@ -14,6 +14,8 @@ The project uses a **disk-based KV-cache** for llama.cpp, implemented as an HTTP
 
 **Note:** this only works in single-threaded mode — only one conversation slot is managed at a time.
 
+Both the Anthropic (`/v1/messages`) and OpenAI-compatible (`/v1/chat/completions`) chat endpoints are managed; all other routes pass through unchanged.
+
 ### Usage
 
 ```sh

@@ -20,6 +20,7 @@ import (
 
 const (
 	messagesPath         = "/v1/messages"
+	chatCompletionsPath  = "/v1/chat/completions"
 	slotPath             = "/slots/0"
 	jsonContentType      = "application/json"
 	chatCacheSuffix      = "--chat.bin"
@@ -120,7 +121,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	slog.Info("proxy", "method", r.Method, "path", r.URL.Path, "upstream", p.upstreamURL)
 
-	if p.baseModel == "" || r.URL.Path != messagesPath {
+	if p.baseModel == "" || (r.URL.Path != messagesPath && r.URL.Path != chatCompletionsPath) {
 		p.reverseProxy.ServeHTTP(w, r)
 		return
 	}
@@ -132,7 +133,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	action, req := p.determineCacheAction(body)
+	action, req := p.determineCacheAction(r.URL.Path, body)
 	p.executeCacheAction(action, req)
 
 	r.Body = io.NopCloser(bytes.NewReader(body))
@@ -162,6 +163,7 @@ func (p *Proxy) readRequestBody(r *http.Request) ([]byte, error) {
 type cacheAction struct {
 	modelCache    string
 	systemCache   string
+	instructions  []Content
 	erase         bool
 	warmup        bool
 	restoreChat   bool
@@ -171,14 +173,19 @@ type cacheAction struct {
 
 // determineCacheAction reads the request body, computes cache keys,
 // and returns the appropriate cache action along with the parsed request.
-func (p *Proxy) determineCacheAction(body []byte) (cacheAction, *requestBody) {
+func (p *Proxy) determineCacheAction(path string, body []byte) (cacheAction, *requestBody) {
 	var req requestBody
 	if err := json.Unmarshal(body, &req); err != nil {
 		slog.Error("parse body", "err", err)
 		return cacheAction{}, nil
 	}
 
-	instructions := extractSystemInstructions(req.Messages)
+	var instructions []Content
+	if path == chatCompletionsPath {
+		req.System, req.Messages = extractOpenAISystem(req.Messages)
+	} else {
+		instructions = extractSystemInstructions(req.Messages)
+	}
 
 	modelCache := req.Model + chatCacheSuffix
 	systemHash, err := hashSystem(req.System, req.Tools, instructions)
@@ -190,8 +197,9 @@ func (p *Proxy) determineCacheAction(body []byte) (cacheAction, *requestBody) {
 	switchedModel := p.modelCacheName != modelCache
 
 	action := cacheAction{
-		modelCache:  modelCache,
-		systemCache: systemCache,
+		modelCache:   modelCache,
+		systemCache:  systemCache,
+		instructions: instructions,
 	}
 
 	if !systemCacheFileExists(p.slotSavePath, systemCache) {
@@ -225,8 +233,7 @@ func (p *Proxy) executeCacheAction(action cacheAction, req *requestBody) {
 	}
 
 	if action.warmup && req != nil {
-		instructions := extractSystemInstructions(req.Messages)
-		p.warmupSystem(req.System, req.Tools, instructions)
+		p.warmupSystem(req.System, req.Tools, action.instructions)
 		p.saveCache(action.systemCache)
 		p.cleanupSystemCaches(req.Model, action.systemCache)
 	}
@@ -460,6 +467,27 @@ func isUserOnlyConversation(messages []Message) bool {
 		}
 	}
 	return true
+}
+
+// extractOpenAISystem splits OpenAI-format messages into the system prompt
+// and the remaining chat messages. The system prompt is returned as a JSON
+// array of text blocks (a valid Anthropic "system" value) so it can be used
+// for both cache hashing and the warmup request.
+func extractOpenAISystem(messages []Message) (json.RawMessage, []Message) {
+	var system []Content
+	var chat []Message
+	for _, m := range messages {
+		if m.Role == "system" {
+			system = append(system, m.Content...)
+			continue
+		}
+		chat = append(chat, m)
+	}
+	if len(system) == 0 {
+		return nil, chat
+	}
+	raw, _ := json.Marshal(system)
+	return raw, chat
 }
 
 // extractSystemInstructions extracts system instruction messages from a conversation.
